@@ -46,8 +46,11 @@ tusb_desc_device_t const desc_device =
     .bDeviceProtocol    = 0x00,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
 
-    .idVendor           = 0x2E8A, // Pi
-    .idProduct          = 0x000c, // CMSIS-DAP Debug Probe
+    // PLACEHOLDER: upstream Raspberry Pi Debug Probe VID:PID, kept until a
+    // dedicated ID is allocated. Tracked in alplabai/alp-sdk#405 and
+    // alplabai/alp-studio#52.
+    .idVendor           = 0x2E8A,
+    .idProduct          = 0x000c,
     .bcdDevice          = 0x0231, // Version 02.31
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -71,6 +74,10 @@ enum
   ITF_NUM_PROBE, // Old versions of Keil MDK only look at interface 0
   ITF_NUM_CDC_COM,
   ITF_NUM_CDC_DATA,
+#ifdef PROBE_UART1_INTERFACE
+  ITF_NUM_CDC1_COM,
+  ITF_NUM_CDC1_DATA,
+#endif
   ITF_NUM_TOTAL
 };
 
@@ -79,11 +86,16 @@ enum
 #define CDC_DATA_IN_EP_NUM 0x83
 #define DAP_OUT_EP_NUM 0x04
 #define DAP_IN_EP_NUM 0x85
+#define CDC1_NOTIFICATION_EP_NUM 0x86
+#define CDC1_DATA_OUT_EP_NUM 0x07
+#define CDC1_DATA_IN_EP_NUM 0x88
+
+#define NUM_CDC CFG_TUD_CDC
 
 #if (PROBE_DEBUG_PROTOCOL == PROTO_DAP_V1)
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + NUM_CDC * TUD_CDC_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
 #else
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN)
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + NUM_CDC * TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN)
 #endif
 
 static uint8_t const desc_hid_report[] =
@@ -111,8 +123,12 @@ uint8_t desc_configuration[] =
   // Bulk
   TUD_VENDOR_DESCRIPTOR(ITF_NUM_PROBE, 0, DAP_OUT_EP_NUM, DAP_IN_EP_NUM, 64),
 #endif
-  // Interface 1 + 2
+  // Interface 1 + 2: CDC0 (channel 0 UART)
   TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_COM, 6, CDC_NOTIFICATION_EP_NUM, 64, CDC_DATA_OUT_EP_NUM, CDC_DATA_IN_EP_NUM, 64),
+#ifdef PROBE_UART1_INTERFACE
+  // Interface 3 + 4: CDC1 (channel 1 UART)
+  TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1_COM, 7, CDC1_NOTIFICATION_EP_NUM, 64, CDC1_DATA_OUT_EP_NUM, CDC1_DATA_IN_EP_NUM, 64),
+#endif
 };
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR
@@ -121,8 +137,12 @@ uint8_t desc_configuration[] =
 uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
 {
   (void) index; // for multiple configurations
-  /* Hack in CAP_BREAK support */
-  desc_configuration[CONFIG_TOTAL_LEN - TUD_CDC_DESC_LEN + 8 + 9 + 5 + 5 + 4 - 1] = 0x6;
+  /* Hack in CAP_BREAK support: set bmCapabilities (last byte of the ACM
+   * functional descriptor) to 0x6 (line coding + send break) in every CDC
+   * block. The CDC blocks are last in the config, back to back; each is
+   * IAD(8) + interface(9) + header func(5) + call mgmt func(5) + ACM func(4). */
+  for (int i = 0; i < NUM_CDC; i++)
+    desc_configuration[CONFIG_TOTAL_LEN - (NUM_CDC - i) * TUD_CDC_DESC_LEN + 8 + 9 + 5 + 5 + 4 - 1] = 0x6;
   return desc_configuration;
 }
 
@@ -135,11 +155,16 @@ char const* string_desc_arr [] =
 {
   (const char[]) { 0x09, 0x04 }, // 0: is supported language is English (0x0409)
   "Raspberry Pi", // 1: Manufacturer
-  PROBE_PRODUCT_STRING, // 2: Product
+  PROBE_PRODUCT_STRING, // 2: Product (must keep "CMSIS-DAP" for host detection)
   usb_serial,     // 3: Serial, uses flash unique ID
   "CMSIS-DAP v1 Interface", // 4: Interface descriptor for HID transport
   "CMSIS-DAP v2 Interface", // 5: Interface descriptor for Bulk transport
+#ifdef PROBE_UART1_INTERFACE
+  "Alp SE-UART",           // 6: Interface descriptor for CDC0
+  "Alp App Console",       // 7: Interface descriptor for CDC1
+#else
   "CDC-ACM UART Interface", // 6: Interface descriptor for CDC
+#endif
 };
 
 static uint16_t _desc_str[32];
