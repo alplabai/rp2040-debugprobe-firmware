@@ -100,16 +100,18 @@ jittery to resolve one inference, so the probe samples the I2C monitors itself
 and the host drains a timestamped ring. The firmware does no unit conversion:
 the host decodes the monitor registers (INA2xx-class or any other I2C chip).
 
-`ALP_STREAM_CONFIG` stops a running stream, then sets: `period_us` (200..;
-rounded up to the 50 us FreeRTOS tick), `marker` (pin table index, `0xFF` =
+`ALP_STREAM_CONFIG` stops a running stream, then sets: `period_us` (200..10000000,
+i.e. 200 us to 10 s; rounded up to the 50 us FreeRTOS tick), `marker` (pin table index, `0xFF` =
 none) and `n` channels (1..8). Per sample, for each channel in order: write `reg`
 (1 byte, repeated start), read `len` bytes (1..4). `addr7` is checked as in
 `ALP_I2C_XFER`. A rejected config leaves the stream unconfigured. `status`: 0
-OK, 3 bad period, `n`, address, `len`, marker index, or record too large, 4 no
-I2C. The ring is not cleared by CONFIG; START clears it.
+OK, 3 period outside 200..10000000, bad `n`, address, `len`, marker index, or record too large, 4 no
+I2C or the sampler task could not be created (INFO then omits the STREAM bit). A
+successful CONFIG empties the ring (record size may change); START clears it too.
 
 `ALP_STREAM_START`: status 0 (also when already running; nothing is reset), 6 not
-configured. `ALP_STREAM_STOP` returns after the sampler has parked; the ring keeps
+configured. `ALP_STREAM_STOP` wakes the sampler and returns once it has parked (within one
+sample, not a full period); a USB unmount also stops the stream; the ring keeps
 its records so the host can drain them.
 
 `ALP_STREAM_READ` returns as many whole records as fit in one packet
@@ -136,8 +138,8 @@ delays the drain. It sits below the USB and UART tasks: those preempt a sample
 (the timestamp records it) and a saturated bus cannot starve USB. If the sampler
 falls behind it resyncs instead of bursting. The ring is 12288 bytes of
 fixed-size records (`12288 / recsize` slots), single producer (sampler) and
-single consumer (DAP thread), each side writing only its own counter with
-memory fences around the hand-off; a full ring drops the new sample and counts it.
+single consumer (DAP thread), each side writing only its own counter (counters wrap at 2 x slots, so
+full and empty stay distinct) with memory fences around the hand-off; a full ring drops the new sample and counts it.
 
 **Timing limits.** Bus time per channel is about `30 + 9 * len` SCL clocks
 (address+W, reg, repeated start + address+R, `len` data bytes, start/stop), plus

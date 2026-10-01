@@ -111,6 +111,17 @@ def dec_stream_read(r):
     return st, size, dropped, recs
 
 
+def unwrap_ts(rows):
+    """Extend the u32 microsecond timestamps to 64 bit (running offset)."""
+    out, off, prev = [], 0, None
+    for ts, flags, data in rows:
+        if prev is not None and ts < prev and prev - ts > 1 << 31:
+            off += 1 << 32
+        prev = ts
+        out.append((ts + off, flags, data))
+    return out
+
+
 def selftest():
     assert enc_info() == b"\x80"
     assert dec_info(bytes([0x80, 1, 3, 2, 59])) == dict(version=1, i2c=True, gpio=True, stream=False, npins=2, i2c_max=59)
@@ -137,6 +148,10 @@ def selftest():
         bytes([0x20, 0x4E, 0, 0, 6, 0x00, 0x00])
     assert dec_stream_read(r) == (0, 7, 5, [(10000, 1, b"\xab\xcd"), (20000, 6, b"\x00\x00")])
     assert dec_stream_read(bytes([0x89, 6, 0, 0, 0, 0, 0, 0])) == (6, 0, 0, [])
+    assert unwrap_ts([(0xFFFFFFF0, 0, b""), (0x10, 0, b""), (0x20, 0, b"")]) == [
+        (0xFFFFFFF0, 0, b""), (0x100000010, 0, b""), (0x100000020, 0, b"")]
+    assert unwrap_ts([(5, 0, b""), (3, 0, b"")])[1][0] == 3  # small backstep is not a wrap
+    assert enc_stream_config(10_000_000, 0xFF, [(0x4A, 1, 2)])[1:5] == struct.pack("<I", 10_000_000)
     print("selftest ok")
 
 
@@ -183,6 +198,9 @@ def pin_index(p, name):
 
 
 def run_stream(p, a):
+    info = dec_info(p.xfer(enc_info()))
+    if not info["stream"]:
+        sys.exit(f"probe firmware (protocol v{info['version']}) has no stream support; update it")
     chans = []
     for c in a.chan:
         addr, reg, n = (int(x, 0) for x in c.split(":"))
@@ -195,15 +213,18 @@ def run_stream(p, a):
     if st:
         sys.exit(f"stream start: {I2C_ST[st] if st < len(I2C_ST) else st}")
     rows, dropped, end = [], 0, time.monotonic() + a.seconds
-    while time.monotonic() < end:
-        st, _, dropped, recs = dec_stream_read(p.xfer(enc_stream_read()))
-        rows += recs
-    p.xfer(enc_stream_stop())
+    try:
+        while time.monotonic() < end:
+            st, _, dropped, recs = dec_stream_read(p.xfer(enc_stream_read()))
+            rows += recs
+    finally:  # never leave the probe sampling (and I2C busy) after a host error
+        p.xfer(enc_stream_stop())
     while True:  # drain what the sampler left in the ring
         st, _, dropped, recs = dec_stream_read(p.xfer(enc_stream_read()))
         if not recs:
             break
         rows += recs
+    rows = unwrap_ts(rows)
     jsonl = a.out and a.out.endswith(".jsonl")
     f = open(a.out, "w") if a.out else sys.stdout
     if not jsonl:

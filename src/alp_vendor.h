@@ -44,4 +44,7 @@ enum {
 // Validates the board pin table and sets up I2C. Call once before the DAP thread runs.
 void alp_vendor_init(void);
 
+// Stop any running stream (USB unmounted). Safe from any task.
+void alp_vendor_usb_unmount(void);
+
 #endif

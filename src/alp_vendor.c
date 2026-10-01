@@ -142,6 +142,10 @@ static void pin_apply(uint8_t i, uint8_t mode)
 
 #if ALP_HAVE_I2C
 static void stream_init(void);
+static bool stream_ok;
+#define STREAM_AVAILABLE stream_ok
+#else
+#define STREAM_AVAILABLE 0
 #endif
 
 void alp_vendor_init(void)
@@ -246,6 +250,7 @@ static uint32_t cmd_i2c_config(const uint8_t *req, uint8_t *resp)
 // fence, copy, release fence, tail++. A full ring drops the new sample.
 #define STREAM_RING_BYTES 12288U
 #define STREAM_MIN_PERIOD_US 200U
+#define STREAM_MAX_PERIOD_US 10000000U
 #define STREAM_MAX_CHAN 8U
 #define STREAM_REC_HDR 5U
 #define STREAM_RESP_HDR 8U
@@ -260,23 +265,43 @@ static struct {
 static uint8_t nchan, marker_gpio, rec_size, configured;
 static uint32_t period_ticks, nslots;
 static uint8_t ring[STREAM_RING_BYTES] __attribute__((aligned(4)));
-static volatile uint32_t ring_head, ring_tail; // free-running record counters
+static volatile uint32_t ring_head, ring_tail; // record counters, always in [0, 2 * nslots)
 static volatile uint32_t dropped;              // written by the sampler only
-static volatile uint8_t run_req;               // written by the DAP thread only
+static volatile uint8_t run_req;               // set by the DAP thread; cleared by it or on USB unmount
 static volatile uint8_t sampler_active;        // written by the sampler only
 static TaskHandle_t sampler_task;
+
 
 static bool stream_busy(void)
 {
 	return run_req || sampler_active;
 }
 
+// USB unmounted (host gone or crashed): stop sampling. The sampler parks itself.
+void alp_vendor_usb_unmount(void)
+{
+	run_req = 0;
+}
+
 static void stream_stop(void)
 {
 	run_req = 0;
 	__mem_fence_release();
-	while (sampler_active) // the sampler parks within one sample, bounded by the I2C timeouts
+	xTaskNotifyGive(sampler_task); // cut the sampler's inter-sample wait short
+	while (sampler_active) // it parks within one sample, bounded by the I2C timeouts
 		vTaskDelay(1);
+}
+
+// Ring counters wrap at 2 * nslots, so "full" (used == nslots) and "empty"
+// stay distinguishable and a non-power-of-two nslots is safe.
+static uint32_t ring_used(uint32_t head, uint32_t tail)
+{
+	return (head + 2U * nslots - tail) % (2U * nslots);
+}
+
+static uint32_t ring_slot(uint32_t idx)
+{
+	return idx >= nslots ? idx - nslots : idx;
 }
 
 static void sample_once(uint8_t *rec, bool overflow)
@@ -312,18 +337,27 @@ static void sampler_thread(void *arg)
 		TickType_t last = xTaskGetTickCount();
 		while (run_req) {
 			uint32_t head = ring_head;
-			if (head - ring_tail >= nslots) {
+			if (ring_used(head, ring_tail) >= nslots) {
 				dropped++;
 				overflow = true;
 			} else {
-				sample_once(&ring[(head % nslots) * rec_size], overflow);
+				sample_once(&ring[ring_slot(head) * rec_size], overflow);
 				overflow = false;
 				__mem_fence_release();
-				ring_head = head + 1;
+				ring_head = (head + 1U) % (2U * nslots);
 			}
-			// Behind schedule (preempted by USB): resync instead of bursting.
-			if (xTaskDelayUntil(&last, period_ticks) == pdFALSE)
-				last = xTaskGetTickCount();
+			// Wait out the period, but wake early on STOP (notification). Behind
+			// schedule (preempted by USB): resync instead of bursting.
+			TickType_t next = last + period_ticks, now = xTaskGetTickCount();
+			if ((int32_t)(next - now) <= 0) {
+				last = now;
+				continue;
+			}
+			while (run_req && (int32_t)(next - now) > 0) {
+				ulTaskNotifyTake(pdTRUE, next - now);
+				now = xTaskGetTickCount();
+			}
+			last = next;
 		}
 		sampler_active = 0;
 	}
@@ -331,7 +365,9 @@ static void sampler_thread(void *arg)
 
 static void stream_init(void)
 {
-	xTaskCreate(sampler_thread, "ALPS", 384, NULL, tskIDLE_PRIORITY + 1, &sampler_task);
+	if (xTaskCreate(sampler_thread, "ALPS", 384, NULL, tskIDLE_PRIORITY + 1, &sampler_task) != pdPASS)
+		return; // no stream: INFO omits the feature bit and the commands answer status 4
+	stream_ok = true;
 #if (configNUMBER_OF_CORES > 1)
 	vTaskCoreAffinitySet(sampler_task, 1 << 0); // core 0, away from the DAP thread (core 1)
 #endif
@@ -345,10 +381,14 @@ static uint32_t cmd_stream_config(const uint8_t *req, uint8_t *resp)
 
 	if (consumed > DAP_PACKET_SIZE)
 		consumed = DAP_PACKET_SIZE;
+	if (!stream_ok) {
+		resp[1] = I2C_NA;
+		return (consumed << 16) | 2U;
+	}
 	stream_stop();
 	configured = 0;
 	resp[1] = I2C_BAD_LEN;
-	if (period < STREAM_MIN_PERIOD_US || n < 1 || n > STREAM_MAX_CHAN || 7U + 3U * n > DAP_PACKET_SIZE ||
+	if (period < STREAM_MIN_PERIOD_US || period > STREAM_MAX_PERIOD_US || n < 1 || n > STREAM_MAX_CHAN || 7U + 3U * n > DAP_PACKET_SIZE ||
 	    (marker != STREAM_MARKER_NONE && marker >= npins))
 		return (consumed << 16) | 2U;
 	for (unsigned i = 0; i < n; i++) {
@@ -368,7 +408,8 @@ static uint32_t cmd_stream_config(const uint8_t *req, uint8_t *resp)
 	marker_gpio = marker == STREAM_MARKER_NONE ? STREAM_MARKER_NONE : pins[marker].gpio;
 	rec_size = size;
 	nslots = STREAM_RING_BYTES / size;
-	period_ticks = (period * configTICK_RATE_HZ + 999999U) / 1000000U; // round up
+	period_ticks = ((uint64_t)period * configTICK_RATE_HZ + 999999U) / 1000000U; // round up
+	ring_head = ring_tail = dropped = 0; // old records have the old framing
 	configured = 1;
 	resp[1] = I2C_OK;
 	return (consumed << 16) | 2U;
@@ -376,7 +417,9 @@ static uint32_t cmd_stream_config(const uint8_t *req, uint8_t *resp)
 
 static uint32_t cmd_stream_start(uint8_t *resp)
 {
-	if (!configured) {
+	if (!stream_ok) {
+		resp[1] = I2C_NA;
+	} else if (!configured) {
 		resp[1] = STREAM_NOCFG;
 	} else {
 		resp[1] = I2C_OK;
@@ -393,22 +436,28 @@ static uint32_t cmd_stream_start(uint8_t *resp)
 static uint32_t cmd_stream_read(uint8_t *resp)
 {
 	memset(resp + 1, 0, STREAM_RESP_HDR - 1);
-	if (!configured) {
-		resp[1] = STREAM_NOCFG;
+	if (!stream_ok || !configured) {
+		resp[1] = stream_ok ? STREAM_NOCFG : I2C_NA;
 		return (1U << 16) | STREAM_RESP_HDR;
 	}
 	uint32_t tail = ring_tail, head = ring_head;
 	__mem_fence_acquire();
-	uint32_t n = MIN(head - tail, (DAP_PACKET_SIZE - STREAM_RESP_HDR) / rec_size);
+	uint32_t n = MIN(ring_used(head, tail), (DAP_PACKET_SIZE - STREAM_RESP_HDR) / rec_size);
 	uint32_t d = dropped;
 	for (uint32_t i = 0; i < n; i++)
-		memcpy(resp + STREAM_RESP_HDR + i * rec_size, &ring[((tail + i) % nslots) * rec_size], rec_size);
+		memcpy(resp + STREAM_RESP_HDR + i * rec_size, &ring[ring_slot((tail + i) % (2U * nslots)) * rec_size], rec_size);
 	__mem_fence_release();
-	ring_tail = tail + n;
+	ring_tail = (tail + n) % (2U * nslots);
 	resp[2] = n;
 	resp[3] = rec_size;
 	memcpy(resp + 4, &d, 4);
 	return (1U << 16) | (STREAM_RESP_HDR + n * rec_size);
+}
+#endif
+
+#if !ALP_HAVE_I2C
+void alp_vendor_usb_unmount(void)
+{
 }
 #endif
 
@@ -420,7 +469,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response)
 	case ALP_ID_INFO:
 		response[1] = ALP_PROTO_VERSION;
 		response[2] = (ALP_HAVE_I2C ? ALP_FEAT_I2C : 0) | (npins ? ALP_FEAT_GPIO : 0) |
-		              (ALP_HAVE_I2C ? ALP_FEAT_STREAM : 0);
+		              (STREAM_AVAILABLE ? ALP_FEAT_STREAM : 0);
 		response[3] = npins;
 		response[4] = ALP_HAVE_I2C ? I2C_MAX_LEN : 0;
 		return (1U << 16) | 5U;
