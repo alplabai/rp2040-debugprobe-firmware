@@ -39,6 +39,7 @@
 #include "tusb.h"
 
 #include "probe_config.h"
+#include "alp_vendor.h"
 #include "probe.h"
 #include "cdc_uart.h"
 #include "autobaud.h"
@@ -157,6 +158,7 @@ int main(void) {
 #endif
 
     DAP_Setup();
+    alp_vendor_init();
 
     probe_info("Welcome to debugprobe!\n");
 

@@ -25,12 +25,12 @@ add_executable(debugprobe
         src/sw_dp_pio.c
         src/tusb_edpt_handler.c
         src/autobaud.c
+        src/alp_vendor.c
 )
 
 target_sources(debugprobe PRIVATE
         CMSIS_DAP/CMSIS/DAP/Firmware/Source/DAP.c
         CMSIS_DAP/CMSIS/DAP/Firmware/Source/JTAG_DP.c
-        CMSIS_DAP/CMSIS/DAP/Firmware/Source/DAP_vendor.c
         CMSIS_DAP/CMSIS/DAP/Firmware/Source/SWO.c
         #CMSIS_DAP/CMSIS/DAP/Firmware/Source/SW_DP.c
         )
@@ -91,6 +91,7 @@ target_link_libraries(debugprobe PRIVATE
         tinyusb_device
         tinyusb_board
         hardware_pio
+        hardware_i2c
         hardware_dma
         hardware_irq
         hardware_clocks

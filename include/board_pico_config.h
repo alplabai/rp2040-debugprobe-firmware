@@ -56,6 +56,20 @@
 
 #define PROBE_USB_CONNECTED_LED 25
 
+// Vendor commands (alp_vendor.c). Development pins only, all free on the Pico:
+// I2C0 SDA/SCL on GP16/GP17; demo pins GP20/GP21 (GP20 and GP21 are not used by
+// SWD GP2/GP3, reset GP1, UART0 GP12/13, UART1 GP8/9 or the LED GP25).
+// The Pico has no I2C pull-ups, so enable the internal ones.
+#define PROBE_I2C_INTERFACE i2c0
+#define PROBE_I2C_SDA 16
+#define PROBE_I2C_SCL 17
+#define PROBE_I2C_BAUDRATE 100000
+#define PROBE_I2C_INTERNAL_PULLUP
+#define PROBE_PIN_TABLE { \
+	{20, "DEMO_A", 0}, \
+	{21, "DEMO_B", 0}, \
+}
+
 #define PROBE_PRODUCT_STRING "Alp Lab Debug Probe on Pico (CMSIS-DAP)"
 
 #endif
