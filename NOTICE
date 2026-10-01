@@ -1,0 +1,9 @@
+This firmware is derived from raspberrypi/debugprobe
+(https://github.com/raspberrypi/debugprobe), v2.3.1.
+
+Copyright (c) Raspberry Pi (Trading) Ltd. and the debugprobe contributors.
+Licensed under the MIT License; see LICENSE. Individual files carry their own
+licence headers (MIT, BSD, Apache-2.0 for bundled CMSIS-DAP and FreeRTOS), which
+remain in force.
+
+Modifications and new files: Copyright (c) Alp Lab AB, MIT License.
