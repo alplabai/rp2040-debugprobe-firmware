@@ -63,7 +63,12 @@
 
 //------------- CLASS -------------//
 #define CFG_TUD_HID             1
+#include "probe_config.h"
+#ifdef PROBE_UART1_INTERFACE
+#define CFG_TUD_CDC             2
+#else
 #define CFG_TUD_CDC             1
+#endif
 #define CFG_TUD_MSC             0
 #define CFG_TUD_MIDI            0
 #define CFG_TUD_VENDOR          1

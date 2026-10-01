@@ -39,6 +39,8 @@
 #define PROBE_PIN_SWDIO (PROBE_PIN_OFFSET + 2)
 
 // UART config
+// Only one UART connector on this hardware: channel 1 (PROBE_UART1_*) stays
+// undefined, so the build is single-CDC.
 #define PROBE_UART_TX 4
 #define PROBE_UART_RX 5
 #define PROBE_UART_INTERFACE uart1

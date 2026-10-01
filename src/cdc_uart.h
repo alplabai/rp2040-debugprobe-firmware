@@ -26,10 +26,23 @@
 #ifndef CDC_UART_H
 #define CDC_UART_H
 
+#include "probe_config.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* Number of CDC-ACM UART channels: 1, or 2 when the board defines PROBE_UART1_INTERFACE. */
+#ifdef PROBE_UART1_INTERFACE
+#define CDC_UART_COUNT 2
+#else
+#define CDC_UART_COUNT 1
+#endif
+
 void cdc_thread(void *ptr);
 void cdc_uart_init(void);
 bool cdc_task(void);
-
-extern TaskHandle_t uart_taskhandle;
+void cdc_uart_tasks_create(UBaseType_t prio);
+void cdc_uart_tasks_suspend(void);
+void cdc_uart_tasks_resume(void);
+void cdc_uart_tasks_delete(void);
 
 #endif

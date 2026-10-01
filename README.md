@@ -1,79 +1,91 @@
-# Debugprobe
+# rp2040-debugprobe-firmware
 
-Firmware source for the Raspberry Pi Debug Probe SWD/UART accessory. Can also be run on a Raspberry Pi Pico or Pico 2.
+RP2040 on-board debug probe firmware for Alp Lab E1M evaluation kits. One USB
+device exposes:
 
-[Raspberry Pi Debug Probe product page](https://www.raspberrypi.com/products/debug-probe/)
+- **CMSIS-DAP v2** (bulk) for SWD debug and flashing,
+- **CDC-ACM "Alp SE-UART"**, the secure-enclave ISP / recovery serial port,
+- **CDC-ACM "Alp App Console"**, the application console.
 
-[Raspberry Pi Pico product page](https://www.raspberrypi.com/products/raspberry-pi-pico/)
+Derived from [raspberrypi/debugprobe](https://github.com/raspberrypi/debugprobe)
+(v2.3.1), Copyright (c) Raspberry Pi (Trading) Ltd. and contributors, MIT
+licensed. See [LICENSE](LICENSE) and [NOTICE](NOTICE). New code in this fork is
+Copyright (c) Alp Lab AB, also MIT.
 
-[Raspberry Pi Pico 2 product page](https://www.raspberrypi.com/products/raspberry-pi-pico-2/)
+SDK-side integration (board documentation, runner configuration, hardware-in-
+the-loop tests) lives in [alplabai/alp-sdk](https://github.com/alplabai/alp-sdk),
+not here.
 
-# Documentation
+## USB contract
 
-Debug Probe documentation can be found at the [Raspberry Pi documentation](https://www.raspberrypi.com/documentation/microcontrollers/debug-probe.html#about-the-debug-probe) and in the [Getting Started with Pico PDF](https://pip.raspberrypi.com/documents/RP-008276-DS).
+Host tooling should identify the serial ports by interface string, not by
+enumeration order.
 
-# Hacking
+| Interface | Function | String | Endpoints | UART |
+|---:|---|---|---|---|
+| 0 | CMSIS-DAP v2 (vendor/bulk) | `CMSIS-DAP v2 Interface` | OUT `0x04`, IN `0x85` | n/a (SWD via PIO) |
+| 1, 2 | CDC0 (IAD) | `Alp SE-UART` | notify IN `0x81`, data OUT `0x02`, IN `0x83` | UART0 |
+| 3, 4 | CDC1 (IAD) | `Alp App Console` | notify IN `0x86`, data OUT `0x07`, IN `0x88` | UART1 |
 
-For the purpose of making changes or studying of the code, you may want to compile the code yourself.
+- CDC0 follows the host line coding (arbitrary baud rate, parity, stop bits),
+  including send-break. The upstream autobaud feature applies to CDC0 only.
+- CDC1 is optional and compile-time per board (`PROBE_UART1_INTERFACE`,
+  `PROBE_UART1_TX`, `PROBE_UART1_RX` in the board config header). Without it
+  the build is single-CDC: interfaces 0-2 only, string `CDC-ACM UART Interface`.
+- The product string contains `CMSIS-DAP` so OpenOCD, pyOCD and probe-rs detect
+  the probe.
 
-First, clone the repository:
+### VID/PID (placeholder)
+
+The device uses the upstream Raspberry Pi Debug Probe ID `0x2E8A:0x000c`. This
+is a **placeholder** until a dedicated ID is allocated, tracked in
+[alplabai/alp-sdk#405](https://github.com/alplabai/alp-sdk/issues/405) and
+[alplabai/alp-studio#52](https://github.com/alplabai/alp-studio/issues/52). It
+is defined in one place: `desc_device` in `src/usb_descriptors.c`.
+
+## Supported boards
+
+| Board header | Target | Channels |
+|---|---|---|
+| `include/board_pico_config.h` | Raspberry Pi Pico (`-DDEBUG_ON_PICO=ON`) | CDC0 UART0 (GP12 TX / GP13 RX), CDC1 UART1 (GP8 TX / GP9 RX) |
+| `include/board_debug_probe_config.h` | Raspberry Pi Debug Probe hardware | CDC0 only, UART1 (GP4 TX / GP5 RX); channel 1 disabled (single UART connector) |
+
+A `board_alp_e1m_evk_config.h` will be added once the schematic of the E1M EVK
+board revision carrying the RP2040 is fixed. Until then there is no Alp Lab EVK
+board config and no EVK pin assignment in this repository.
+
+## Build
+
+Requires pico-sdk 2.2.0 (with submodules), the Arm GNU toolchain
+(`arm-none-eabi-gcc`), CMake and Ninja. Clone with submodules
+(`git submodule update --init --recursive`), then:
+
+```sh
+export PICO_SDK_PATH=<path to pico-sdk 2.2.0> PICO_TOOLCHAIN_PATH=<toolchain bin dir>
+
+# Debug Probe hardware -> build/debugprobe.uf2
+cmake -G Ninja -S . -B build && ninja -C build
+
+# Raspberry Pi Pico -> build-pico/debugprobe_on_pico.uf2
+cmake -G Ninja -S . -B build-pico -DDEBUG_ON_PICO=ON -DPICO_BOARD=pico && ninja -C build-pico
 ```
-git clone https://github.com/raspberrypi/debugprobe
-cd debugprobe
-```
-Initialize and update the submodules:
-```
- git submodule update --init --recursive
-```
-Then create and switch to the build directory:
-```
- mkdir build
- cd build
-```
-If your environment doesn't contain `PICO_SDK_PATH`, then either add it to your environment variables with `export PICO_SDK_PATH=/path/to/sdk` or add `-DPICO_SDK_PATH=/path/to/sdk` to the arguments to CMake below.
 
-Run cmake and build the code:
-```
- cmake ..
- make
-```
-Done! You should now have a `debugprobe.uf2` that you can upload to your Debug Probe via the UF2 bootloader.
+Both targets must build warning-free (`-Wall`). Load a `.uf2` through the RP2040
+UF2 bootloader.
 
-## Building for the Pico 1
+## Upstream tracking
 
-If you want to create the version that runs on the Pico, then you need to invoke `cmake` in the sequence above with the `DEBUG_ON_PICO=ON` option:
-```
-cmake -DDEBUG_ON_PICO=ON ..
-```
-This will build with the configuration for the Pico and call the output program `debugprobe_on_pico.uf2`, as opposed to `debugprobe.uf2` for the accessory hardware.
+- `upstream-master` mirrors `raspberrypi/debugprobe` `master` (fast-forward only).
+- Upstream changes arrive by merging upstream release tags into `dev`.
+- Upstream files keep their original per-file licence headers; do not relicense them.
 
-Note that if you first ran through the whole sequence to compile for the Debug Probe, then you don't need to start back at the top. You can just go back to the `cmake` step and start from there.
+## Branches and releases
 
-## Building for the Pico 2
+`dev` is the default branch; all pull requests target `dev`. Releases are tags
+`vX.Y.Z`; the release workflow attaches the `.uf2` files. See
+[CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 
-If using an existing debugprobe clone:
-- You must completely regenerate your build directory, or use a different one.
-- You must also sync and update submodules.
-- `PICO_SDK_PATH` must point to a version 2.0.0 or greater install.
+## Status
 
-```
-git submodule sync
-git submodule update --init --recursive
-mkdir build-pico2
-cd build-pico2
-cmake -DDEBUG_ON_PICO=1 -DPICO_BOARD=pico2 ../
-```
-This will build with the configuration for the Pico 2 and call the output program `debugprobe_on_pico2.uf2`.
-
-# AutoBaud
-
-Mode which automatically detects and sets the UART baud rate as data arrives.
-
-To enable AutoBaud, configure the USB CDC port to the following custom baud rate:
-```
-9728 (0x2600)
-```
-> **Note:** Some Linux serial tools cannot set custom baud values. PuTTY on Windows and any terminal that supports arbitrary baud rates works.
-
-Changing the baud rate to any other value disables AutoBaud.
-
+USB enumeration of the two-channel layout is built and descriptor-checked but
+has not been verified on RP2040 hardware yet.

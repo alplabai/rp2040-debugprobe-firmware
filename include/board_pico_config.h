@@ -38,13 +38,24 @@
 #define PROBE_PIN_RESET 1
 
 // UART config
-#define PROBE_UART_TX 4
-#define PROBE_UART_RX 5
-#define PROBE_UART_INTERFACE uart1
+// Channel 0 (CDC0, "Alp SE-UART"): UART0. GP0/GP1 are avoided because GP1 is
+// the target reset line above.
+#define PROBE_UART_TX 12
+#define PROBE_UART_RX 13
+#define PROBE_UART_INTERFACE uart0
 #define PROBE_UART_BAUDRATE 115200
+// UART0 belongs to channel 0, so the probe's own debug stdio must not claim it.
+#define PROBE_NO_STDIO_UART
+
+// Channel 1 (CDC1, "Alp App Console"): UART1 on the standard Pico pins.
+// Leave PROBE_UART1_INTERFACE undefined to build a single-CDC probe.
+#define PROBE_UART1_TX 8
+#define PROBE_UART1_RX 9
+#define PROBE_UART1_INTERFACE uart1
+#define PROBE_UART1_BAUDRATE 115200
 
 #define PROBE_USB_CONNECTED_LED 25
 
-#define PROBE_PRODUCT_STRING "Debugprobe on Pico (CMSIS-DAP)"
+#define PROBE_PRODUCT_STRING "Alp Lab Debug Probe on Pico (CMSIS-DAP)"
 
 #endif
