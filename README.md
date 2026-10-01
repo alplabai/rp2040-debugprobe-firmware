@@ -43,12 +43,90 @@ is a **placeholder** until a dedicated ID is allocated, tracked in
 [alplabai/alp-studio#52](https://github.com/alplabai/alp-studio/issues/52). It
 is defined in one place: `desc_device` in `src/usb_descriptors.c`.
 
+## Vendor commands
+
+Besides SWD and the UART channels the probe offers raw I2C and named-GPIO
+control as CMSIS-DAP vendor commands (request IDs `0x80`..`0x9F`, implemented
+in `src/alp_vendor.c`). They travel over the existing CMSIS-DAP v2 bulk
+interface (interface 0); there is no extra USB interface. The firmware is
+chip-agnostic: the host decodes whatever current-sense chip is on the I2C bus.
+`tools/alp_probe.py` is a host example (`--selftest` checks the encoders against
+the tables below).
+
+All multi-byte values are little-endian. Every response starts with the request
+ID. A request is one DAP packet (`DAP_PACKET_SIZE` = 64 bytes), sent standalone.
+Unknown IDs in `0x86`..`0x9F` reply with the single byte `0xFF` (`ID_DAP_Invalid`).
+
+| ID | Name | Request (after ID) | Response (after ID) |
+|---:|---|---|---|
+| `0x80` | `ALP_INFO` | none | `version` u8 (= 1), `features` u8 (bit0 I2C, bit1 GPIO), `npins` u8, `i2c_max` u8 |
+| `0x81` | `ALP_I2C_XFER` | `addr7` u8, `flags` u8, `wlen` u8, `rlen` u8, `wdata[wlen]` | `status` u8, then `rdata[rlen]` only when `status` = 0 |
+| `0x82` | `ALP_I2C_CONFIG` | `hz` u32 | `actual_hz` u32 |
+| `0x83` | `ALP_PIN_SET` | `index` u8, `mode` u8 | `status` u8, `level` u8 |
+| `0x84` | `ALP_PIN_GET` | `index` u8 | `status` u8, `level` u8, `mode` u8 |
+| `0x85` | `ALP_PIN_INFO` | `index` u8 | `status` u8, `flags` u8, `namelen` u8, `name[namelen]` ASCII |
+
+**`ALP_INFO`**: `npins` counts the pins that survived the boot-time check
+(below). `i2c_max` is the largest `wlen` and `rlen` accepted (`DAP_PACKET_SIZE`
+- 5 = 59), 0 when the board has no I2C. A board with neither I2C nor pins reports
+`features` = 0.
+
+**`ALP_I2C_XFER`**: `flags` bit0 = write-then-read with a repeated start; all
+other bits must be 0. Without bit0 a write and a read are separate transactions
+(each ends with STOP); `wlen` = 0 gives a read only, `rlen` = 0 a write only.
+`wlen` and `rlen` both 0 is rejected, as is bit0 with either 0.
+
+| `status` | Meaning |
+|---:|---|
+| 0 | OK |
+| 1 | NACK or bus error (`PICO_ERROR_GENERIC`) |
+| 2 | timeout (about 3 ms per byte, so a stuck bus never hangs the DAP thread) |
+| 3 | bad length or address: `addr7` < `0x08` or > `0x77`, `wlen`/`rlen` > `i2c_max`, bad flags |
+| 4 | I2C not available on this board |
+
+**`ALP_I2C_CONFIG`**: `hz` is clamped to 10000..1000000; the reply is the baud
+rate the hardware actually got (`i2c_set_baudrate`), or 0 when I2C is not
+available. The boot speed is the board's `PROBE_I2C_BAUDRATE` (default 100000).
+
+**Pins**: `index` is the position in the board pin table (0..`npins`-1), not a
+GPIO number. Names are discovered with `ALP_PIN_INFO`; `flags` bit0 = the pin's
+boot default is not "released". `status`: 0 OK, 1 bad index (every index on a
+board without a table), 2 bad mode (`ALP_PIN_SET` only). On a non-zero status the
+remaining response bytes are 0 (`ALP_PIN_INFO`: `flags` = 0, `namelen` = 0).
+`level` is the pad level read back after the change.
+
+| `mode` | Meaning |
+|---:|---|
+| 0 | release: input, hi-Z, no pull |
+| 1 | drive low |
+| 2 | drive high |
+| 3 | input, pull-up |
+| 4 | input, pull-down |
+
+Pins boot released (mode 0) unless the table gives a safe default, so the probe
+never drives a board strap until the host asks.
+
+### Per-board configuration
+
+I2C is enabled by `PROBE_I2C_INTERFACE`, `PROBE_I2C_SDA`, `PROBE_I2C_SCL` and
+(optionally, default 100000) `PROBE_I2C_BAUDRATE` in the board header;
+`PROBE_I2C_INTERNAL_PULLUP` additionally enables the RP2040 internal pull-ups for
+bare dev boards. The pin table is
+`#define PROBE_PIN_TABLE { {gpio, "NAME", default_mode}, ... }`. Names are
+1..32 ASCII characters. A board defining neither still builds; I2C commands then
+answer status 4 and pin commands status 1.
+
+The I2C pins are checked against the probe's own SWD, reset, UART and LED pins at
+build time. Table entries are checked at boot, and an entry on any of those pins,
+the I2C pins, a duplicate GPIO, a bad GPIO number, a bad default mode or a bad
+name is dropped, so host tooling can never drive the probe's own interfaces.
+
 ## Supported boards
 
 | Board header | Target | Channels |
 |---|---|---|
-| `include/board_pico_config.h` | Raspberry Pi Pico (`-DDEBUG_ON_PICO=ON`) | CDC0 UART0 (GP12 TX / GP13 RX), CDC1 UART1 (GP8 TX / GP9 RX) |
-| `include/board_debug_probe_config.h` | Raspberry Pi Debug Probe hardware | CDC0 only, UART1 (GP4 TX / GP5 RX); channel 1 disabled (single UART connector) |
+| `include/board_pico_config.h` | Raspberry Pi Pico (`-DDEBUG_ON_PICO=ON`) | CDC0 UART0 (GP12 TX / GP13 RX), CDC1 UART1 (GP8 TX / GP9 RX); vendor I2C0 (GP16 SDA / GP17 SCL), pins `DEMO_A` GP20, `DEMO_B` GP21 (dev only) |
+| `include/board_debug_probe_config.h` | Raspberry Pi Debug Probe hardware | CDC0 only, UART1 (GP4 TX / GP5 RX); channel 1 disabled (single UART connector); no vendor I2C or pins |
 
 A `board_alp_e1m_evk_config.h` will be added once the schematic of the E1M EVK
 board revision carrying the RP2040 is fixed. Until then there is no Alp Lab EVK
