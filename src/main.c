@@ -283,6 +283,7 @@ void tud_resume_cb(void)
 void tud_unmount_cb(void)
 {
   probe_info("Disconnected/reset\n");
+  alp_vendor_usb_unmount();
   cdc_uart_tasks_suspend();
   vTaskSuspend(dap_taskhandle);
   cdc_uart_tasks_delete();

@@ -55,16 +55,20 @@ the tables below).
 
 All multi-byte values are little-endian. Every response starts with the request
 ID. A request is one DAP packet (`DAP_PACKET_SIZE` = 64 bytes), sent standalone.
-Unknown IDs in `0x86`..`0x9F` reply with the single byte `0xFF` (`ID_DAP_Invalid`).
+Unknown IDs in `0x8A`..`0x9F` reply with the single byte `0xFF` (`ID_DAP_Invalid`).
 
 | ID | Name | Request (after ID) | Response (after ID) |
 |---:|---|---|---|
-| `0x80` | `ALP_INFO` | none | `version` u8 (= 1), `features` u8 (bit0 I2C, bit1 GPIO), `npins` u8, `i2c_max` u8 |
+| `0x80` | `ALP_INFO` | none | `version` u8 (= 2), `features` u8 (bit0 I2C, bit1 GPIO, bit2 STREAM), `npins` u8, `i2c_max` u8 |
 | `0x81` | `ALP_I2C_XFER` | `addr7` u8, `flags` u8, `wlen` u8, `rlen` u8, `wdata[wlen]` | `status` u8, then `rdata[rlen]` only when `status` = 0 |
 | `0x82` | `ALP_I2C_CONFIG` | `hz` u32 | `actual_hz` u32 |
 | `0x83` | `ALP_PIN_SET` | `index` u8, `mode` u8 | `status` u8, `level` u8 |
 | `0x84` | `ALP_PIN_GET` | `index` u8 | `status` u8, `level` u8, `mode` u8 |
 | `0x85` | `ALP_PIN_INFO` | `index` u8 | `status` u8, `flags` u8, `namelen` u8, `name[namelen]` ASCII |
+| `0x86` | `ALP_STREAM_CONFIG` | `period_us` u32, `marker` u8, `n` u8, then `n` x (`addr7` u8, `reg` u8, `len` u8) | `status` u8 |
+| `0x87` | `ALP_STREAM_START` | none | `status` u8 |
+| `0x88` | `ALP_STREAM_STOP` | none | `status` u8 (always 0) |
+| `0x89` | `ALP_STREAM_READ` | none | `status` u8, `count` u8, `recsize` u8, `dropped` u32, then `count` x record |
 
 **`ALP_INFO`**: `npins` counts the pins that survived the boot-time check
 (below). `i2c_max` is the largest `wlen` and `rlen` accepted (`DAP_PACKET_SIZE`
@@ -83,10 +87,82 @@ other bits must be 0. Without bit0 a write and a read are separate transactions
 | 2 | timeout (about 3 ms per byte, so a stuck bus never hangs the DAP thread) |
 | 3 | bad length or address: `addr7` < `0x08` or > `0x77`, `wlen`/`rlen` > `i2c_max`, bad flags |
 | 4 | I2C not available on this board |
+| 5 | busy: a stream is running (see below) |
 
 **`ALP_I2C_CONFIG`**: `hz` is clamped to 10000..1000000; the reply is the baud
 rate the hardware actually got (`i2c_set_baudrate`), or 0 when I2C is not
-available. The boot speed is the board's `PROBE_I2C_BAUDRATE` (default 100000).
+available or a stream is running (this reply has no status byte). The boot speed is the board's `PROBE_I2C_BAUDRATE` (default 100000).
+
+### Power/energy stream (`0x86`..`0x89`)
+
+Single `ALP_I2C_XFER` round trips (USB poll, host scheduling) are too slow and
+jittery to resolve one inference, so the probe samples the I2C monitors itself
+and the host drains a timestamped ring. The firmware does no unit conversion:
+the host decodes the monitor registers (INA2xx-class or any other I2C chip).
+
+`ALP_STREAM_CONFIG` stops a running stream, then sets: `period_us` (200..10000000,
+i.e. 200 us to 10 s; rounded up to the 50 us FreeRTOS tick), `marker` (pin table index, `0xFF` =
+none) and `n` channels (1..8). Per sample, for each channel in order: write `reg`
+(1 byte, repeated start), read `len` bytes (1..4). `addr7` is checked as in
+`ALP_I2C_XFER`. A rejected config leaves the stream unconfigured. `status`: 0
+OK, 3 period outside 200..10000000, bad `n`, address, `len`, marker index, or record too large, 4 no
+I2C or the sampler task could not be created (INFO then omits the STREAM bit). A
+successful CONFIG empties the ring (record size may change); START clears it too.
+
+`ALP_STREAM_START`: status 0 (also when already running; nothing is reset), 6 not
+configured. `ALP_STREAM_STOP` wakes the sampler and returns once it has parked (within one
+sample, not a full period); a USB unmount also stops the stream; the ring keeps
+its records so the host can drain them.
+
+`ALP_STREAM_READ` returns as many whole records as fit in one packet
+(`(64 - 8) / recsize`), oldest first, and works while running or stopped.
+`status` 6 = not configured (`count`, `recsize`, `dropped` = 0). `dropped` counts
+samples discarded since START because the ring was full (wraps at 2^32).
+`recsize` = 5 + sum of the channel `len`s. Record:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | `timestamp_us` u32, `time_us_32()` at the start of the sample (wraps every 71.6 min) |
+| 4 | 1 | `flags`: bit0 marker level (`gpio_get` of the marker pin, 0 without a marker), bit1 an I2C error occurred in this sample (that channel's bytes are 0), bit2 one or more samples were dropped immediately before this record |
+| 5 | `recsize` - 5 | channel bytes, concatenated in configuration order, as read from the chip |
+
+**Busy rule:** from START until STOP completes, `ALP_I2C_XFER` answers status 5
+and `ALP_I2C_CONFIG` answers `actual_hz` = 0, so the DAP thread never touches the
+I2C peripheral while the sampler does. Set the I2C speed with `ALP_I2C_CONFIG`
+before starting; set the marker pin to input with `ALP_PIN_SET` first (the sampler
+only reads it, never changes its mode).
+
+**Arrangement:** a FreeRTOS task `ALPS` (priority idle+1, pinned to core 0)
+sleeps with `xTaskDelayUntil`. The DAP thread runs on core 1, so a busy bus never
+delays the drain. It sits below the USB and UART tasks: those preempt a sample
+(the timestamp records it) and a saturated bus cannot starve USB. If the sampler
+falls behind it resyncs instead of bursting. The ring is 12288 bytes of
+fixed-size records (`12288 / recsize` slots), single producer (sampler) and
+single consumer (DAP thread), each side writing only its own counter (counters wrap at 2 x slots, so
+full and empty stay distinct) with memory fences around the hand-off; a full ring drops the new sample and counts it.
+
+**Timing limits.** Bus time per channel is about `30 + 9 * len` SCL clocks
+(address+W, reg, repeated start + address+R, `len` data bytes, start/stop), plus
+roughly 20 us of driver overhead per channel:
+
+| Setup | Per sample | Realistic max rate |
+|---|---:|---:|
+| 1 channel x 2 bytes, 400 kHz | 120 + 20 = 140 us | about 7 kHz |
+| 2 channels x 2 bytes (e.g. INA236 bus voltage + current), 400 kHz | 240 + 40 = 280 us | about 3.5 kHz |
+| 2 channels x 2 bytes, 1 MHz | 96 + 40 = 136 us | about 7 kHz |
+| 2 channels x 2 bytes, 100 kHz (boot default) | 960 + 40 = 1000 us | 1 kHz |
+
+The firmware enforces only `period_us` >= 200 (5 kHz); a period shorter than the
+sample time just makes the sampler run back to back at that table rate. A 9-byte
+record (2 x 2-byte channels) is 6 per packet, so draining 3.5 kHz needs about
+600 packets/s (unmeasured on hardware; the 12 KiB ring buffers about 390 ms at
+that rate). The monitor's own conversion
+time also bounds useful rates (INA236 default 1.1 ms per conversion at 1 average:
+set the monitor's ADC config via `ALP_I2C_XFER` first).
+
+**Intended use, per-inference energy:** the target toggles a GPIO around each
+inference, wired to a probe table pin; the host sets that pin to input, streams,
+and integrates power between marker edges using the timestamps.
 
 **Pins**: `index` is the position in the board pin table (0..`npins`-1), not a
 GPIO number. Names are discovered with `ALP_PIN_INFO`; `flags` bit0 = the pin's
