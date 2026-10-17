@@ -67,6 +67,8 @@ do { \
 
 #ifdef DEBUG_ON_PICO 
 #include "board_pico_config.h"
+#elif defined(ALP_E1M_EVK)
+#include "board_alp_e1m_evk_config.h"
 #else
 #include "board_debug_probe_config.h"
 #endif

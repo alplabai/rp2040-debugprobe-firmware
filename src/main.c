@@ -47,6 +47,10 @@
 #include "tusb_edpt_handler.h"
 #include "DAP.h"
 #include "hardware/structs/usb.h"
+#ifdef PROBE_PADS_1V8
+#include "hardware/structs/pads_bank0.h"
+#include "hardware/structs/pads_qspi.h"
+#endif
 
 // UART0 for debugprobe debug
 // UART1 for debugprobe to target device
@@ -146,6 +150,11 @@ void usb_thread(void *ptr)
 #endif
 
 int main(void) {
+#ifdef PROBE_PADS_1V8
+    // IOVDD is 1.8 V: select the 1.8 V pad thresholds before touching any pin
+    pads_bank0_hw->voltage_select = PADS_BANK0_VOLTAGE_SELECT_VALUE_1V8;
+    pads_qspi_hw->voltage_select = PADS_QSPI_VOLTAGE_SELECT_VALUE_1V8;
+#endif
     // Declare pins in binary information
     bi_decl_config();
 
