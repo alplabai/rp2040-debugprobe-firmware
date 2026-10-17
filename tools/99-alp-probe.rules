@@ -1,0 +1,6 @@
+# Alp Lab RP2040 debug probe (CMSIS-DAP v2 + vendor commands, two CDC-ACM ports).
+# Install: sudo cp tools/99-alp-probe.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+# VID:PID 2e8a:000c is the upstream Raspberry Pi Debug Probe ID (placeholder, see README "VID/PID").
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000c", MODE="0660", TAG+="uaccess"
+# RP2040 USB bootloader (BOOTSEL), for picotool.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0003", MODE="0660", TAG+="uaccess"

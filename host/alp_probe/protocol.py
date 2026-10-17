@@ -7,6 +7,14 @@ import struct
 INFO, I2C_XFER, I2C_CONFIG, PIN_SET, PIN_GET, PIN_INFO = 0x80, 0x81, 0x82, 0x83, 0x84, 0x85
 STREAM_CONFIG, STREAM_START, STREAM_STOP, STREAM_READ, ADC_READ, BOARD = 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B
 DAP_INFO, DAP_SWJ_PINS = 0x00, 0x10
+# CMSIS-DAP command IDs and fields (CMSIS_DAP/CMSIS/DAP/Firmware/Include/DAP.h)
+DAP_CONNECT, DAP_DISCONNECT, DAP_TRANSFER_CONFIGURE, DAP_TRANSFER = 0x02, 0x03, 0x04, 0x05
+DAP_SWJ_CLOCK, DAP_SWJ_SEQUENCE = 0x11, 0x12
+DAP_PORT_SWD = 1
+DAP_OK = 0
+T_APNDP, T_RNW = 1, 2          # DAP_TRANSFER_APnDP, DAP_TRANSFER_RnW; A[3:2] = register bits 3:2
+T_OK, T_WAIT, T_FAULT = 1, 2, 4  # DAP_TRANSFER_OK / WAIT / FAULT
+DP_IDCODE, DP_ABORT, DP_CTRL_STAT, DP_SELECT, DP_RDBUFF = 0x0, 0x0, 0x4, 0x8, 0xC
 DAP_ID_PRODUCT, DAP_ID_SER_NUM, DAP_ID_FW_VER = 2, 3, 4
 DAP_INVALID = 0xFF
 NRESET_BIT = 0x80  # DAP_SWJ_nRESET = bit 7
@@ -185,3 +193,57 @@ def dec_swj_pins(r):
     """-> pin input byte (bit7 = nRESET level)."""
     _check(r, DAP_SWJ_PINS)
     return r[1]
+
+
+def enc_dap_connect(port=DAP_PORT_SWD):
+    return bytes([DAP_CONNECT, port])
+
+
+def dec_dap_connect(r):
+    """-> port actually connected (0 = failed)."""
+    _check(r, DAP_CONNECT)
+    return r[1]
+
+
+def enc_dap_disconnect():
+    return bytes([DAP_DISCONNECT])
+
+
+def enc_swj_clock(hz):
+    return bytes([DAP_SWJ_CLOCK]) + struct.pack("<I", hz)
+
+
+def enc_swj_sequence(nbits, data):
+    """nbits 1..256 (0 on the wire = 256), data LSB first."""
+    return bytes([DAP_SWJ_SEQUENCE, nbits & 0xFF]) + bytes(data)
+
+
+def enc_transfer_configure(idle=0, retry=64, match_retry=0):
+    return bytes([DAP_TRANSFER_CONFIGURE]) + struct.pack("<BHH", idle, retry, match_retry)
+
+
+def enc_transfer(ops, dap_index=0):
+    """ops: list of (request byte, write value or None). Request byte = APnDP | RnW | A[3:2]."""
+    out = bytes([DAP_TRANSFER, dap_index, len(ops)])
+    for req, val in ops:
+        out += bytes([req]) + (b"" if val is None else struct.pack("<I", val))
+    return out
+
+
+def dec_transfer(r):
+    """-> (count done, last ACK, [read values]). Posted AP reads are resolved by the probe (RDBUFF)."""
+    _check(r, DAP_TRANSFER)
+    data = bytes(r[3:])
+    return r[1], r[2], [struct.unpack("<I", data[i:i + 4])[0] for i in range(0, len(data) - 3, 4)]
+
+
+def dp_read(reg):
+    return (T_RNW | (reg & 0xC), None)
+
+
+def dp_write(reg, val):
+    return (reg & 0xC, val)
+
+
+def ap_read(reg):
+    return (T_APNDP | T_RNW | (reg & 0xC), None)

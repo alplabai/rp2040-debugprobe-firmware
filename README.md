@@ -232,15 +232,18 @@ capped at 4 MHz. Board name `alp-e1m-evk-2641-r3`.
 
 | GPIO | Function |
 |---:|---|
-| 16 / 17 | SWDIO / SWCLK (shared with J2) |
-| 20 | DAP nRESET: Q16 pulls `JTAG_RST` (module E.NSRST, J2.10) low when high |
+| 16 / 17 | SWDIO / SWCLK (shared with J2), to the E8 or the CC3501E per `SWD_SEL` |
+| 20 | DAP nRESET: Q16 pulls `JTAG_RST` (module E.NSRST, J2.10), or `WIFI_RST` when `SWD_SEL` is high, low when high |
 | 4 / 5 | UART1 TX / RX = CDC0 SE-UART (module SEUART on E2.AE3 / E2.AD3) |
 | 0 / 1 | UART0 TX / RX = CDC1 app console (module UART0 pads via S7) |
 | 24 / 25 | I2C bus 0 SDA / SCL: power monitors on CURR_I2C (switch S6 to the RP2040) |
 | 2 / 3 | I2C bus 1 SDA / SCL: module board bus (GreenPAK, RTC, EEPROM) via U14 |
 | 29 | ADC3 = VIO_OUT / 2 |
 | 21 | status LED (USB connected) |
-| 18 / 19 | TDO / TDI, unused in SWD, released |
+| 27 | `SWD_SEL`: U57 TMUX1574 routes SWD and DAP nRESET to the E8 (low, default) or the CC3501E (high) |
+| 9 | `I2C0_LINK_N`: low joins I2C bus 0 to module I2C0 through U58 (module EEPROM U18 at 0x50) |
+| 19 | `MARKER`: inference marker from the E8 (E2.AG6) |
+| 18 | `WIFI_LOGGER`: E8 TDO (SWD_SEL low) or CC3501E LOGGER (SWD_SEL high, reads 1 when the CC3501E is powered) |
 
 Pin table (index, name, GPIO, meaning). All boot released; every FET gate has an
 external pull-down, so released = FET off.
@@ -249,7 +252,7 @@ external pull-down, so released = FET off.
 |---:|---|---:|---|
 | 0..3 | `BOOT0`..`BOOT3` | 13, 12, 11, 10 | module boot straps via 10k (not connected on AEN R3) |
 | 4 | `MCU_RST_RP` | 8 | high = Q17 pulls `MCU_RST` (E.POR_N) low |
-| 5 | `MCU_RST_SENSE` | 9 | input only: `MCU_RST` level (R254 470k) |
+| 5 | `I2C0_LINK_N` | 9 | low = RP I2C bus 0 joined to module I2C0 (released = apart, R304 pull-up) |
 | 6 | `MODULE_EN_RP` | 23 | high = Q18 pulls `MODULE_EN` low: module OFF |
 | 7 | `MODULE_STBY_RP` | 22 | high = Q15 pulls `MODULE_STBY` low |
 | 8 | `RTC_WAKE_N` | 7 | input only: module RTC wake (open-drain) |
@@ -258,10 +261,19 @@ external pull-down, so released = FET off.
 | 11 | `CURR_ALERT_N` | 28 | input only: U29/U53 INA228 ALERT |
 | 12 | `PD_ACTIVE_N` | 14 | input only: 0 = USB-PD contract powers the board |
 | 13 | `PWR_FLT_N` | 15 | input only: 0 = eFuse U9/U12 fault |
+| 14 | `SWD_SEL` | 27 | high = SWD and DAP nRESET to the CC3501E (released = E8, R300 pull-down) |
+| 15 | `MARKER` | 19 | input only: inference marker from the E8 |
+| 16 | `WIFI_LOGGER` | 18 | input only: CC3501E LOGGER while `SWD_SEL` is high |
 
 The 5 V module current range returns from uA to mA only by the hardware trip
 (about 4 mA through R278) or a power cycle; there is no firmware path back.
-The EVK has no dedicated module-to-RP2040 marker line for per-inference windowing.
+This pin map is the 2641-R3 carrier with the RP2040 provisioning additions
+(U57 SWD mux, U58 I2C0 link, marker on E2.AG6); earlier pd exports lack them.
+
+**USB serial number:** U54 (Macronix) may not implement the `0x4B` unique-ID
+command, so the EVK build (`PROBE_SERIAL_IN_FLASH`) keeps a random 64-bit serial
+in the last flash sector (`0x1FF000`, record `ALPS`, version 1, serial, CRC-32),
+created on first boot. A UF2 update keeps it; a full chip erase gives a new one.
 
 **Warning:** `MODULE_EN_RP`, `MCU_RST_RP` and DAP nRESET power off or reset the
 module. I2C bus 1 is shared with the module SoC; use it only while the SoC is held
@@ -300,7 +312,10 @@ alp-probe ports                # SE-UART and app console serial devices
 alp-probe power                # one reading of every monitor on the board
 alp-probe range ua             # 5 V module uA range
 alp-probe stream --seconds 5 --marker NAME --out run.csv   # streamed 5 V module power, energy summary
-alp-probe pin list | reset pulse | por pulse | module off | i2c 0x50 --bus 1 --read 8 | vio
+alp-probe pin list | reset pulse | por pulse | module off | i2c 0x52 --bus 1 --read 8 | vio
+alp-probe eeprom dump --out som.bin   # module EEPROM (raw bytes); holds the SoC in POR meanwhile
+alp-probe swd-target cc35|e8|status   # route SWD to the CC3501E (only when it is powered) or the E8
+alp-probe cc35 info                   # read-only CC3501E Config-AP: IDs, boot diag, lifecycle
 ```
 
 Every command takes `--json` and then prints exactly one JSON object, errors
@@ -309,6 +324,21 @@ probe. Current is the shunt voltage divided by the board's shunt value; register
 LSBs follow TI SBOSA81D (INA236) and SLYS021A (INA228). `stream` sets the INA228
 ADC timing for the period and restores the power-on `ADC_CONFIG` afterwards. On
 Linux the probe needs a udev rule for `2e8a:000c`.
+
+## Flashing the EVK RP2040
+
+1. Build `build-evk/debugprobe_alp_e1m_evk.uf2` (above), or take it from the CI
+   `uf2` artifact or a release.
+2. Hold S2 (BOOTSEL) and press S3 (RUN), or fit JP7, or plug USB with S2 held.
+   The RP2040 enumerates as the `RPI-RP2` drive (USB `2e8a:0003`).
+3. Copy the `.uf2` to the drive (or `picotool load -x debugprobe_alp_e1m_evk.uf2`).
+   Remove JP7 if fitted. The probe re-enumerates as `2e8a:000c` with the CMSIS-DAP
+   interface and the two CDC ports.
+4. On Linux install `tools/99-alp-probe.rules`, then `pip install -e host` and
+   run `alp-probe info` (board `alp-e1m-evk-2641-r3`, protocol 3).
+
+The board must be powered from the barrel jack or a USB-PD source for the module
+side to work; the RP2040 itself runs from the board +3V3.
 
 ## Upstream tracking
 

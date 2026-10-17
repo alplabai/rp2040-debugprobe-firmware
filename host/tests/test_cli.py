@@ -2,11 +2,13 @@
 # Copyright (c) 2026 Alp Lab AB
 """CLI against the fake probe, plus stream decoding and energy integration."""
 import json
+import struct
 
 import pytest
 
 from alp_probe import boards, cli
 from alp_probe import protocol as P
+from conftest import EVK_PINS
 
 
 def run(fake, capsys, *argv):
@@ -153,3 +155,93 @@ def test_stream_cli(fake, capsys, tmp_path):
     cfg = next(r for r in fake.log if r[0] == 0x86)
     assert cfg == bytes([0x86, 0xE8, 0x03, 0, 0, 8, 3, 0x43, 5, 3, 0x43, 4, 3, 0x47, 4, 3])
     assert out.read_text().splitlines()[0] == "timestamp_us,range,vbus_v,current_a,power_w,marker,flags"
+
+
+def test_stream_marker_default(fake, capsys):
+    add_monitors(fake)
+    rc, d = run(fake, capsys, "stream", "--seconds", "0")
+    assert rc == 0
+    cfg = next(r for r in fake.log if r[0] == 0x86)
+    assert cfg[5] == EVK_PINS.index("MARKER")
+
+
+def test_swd_target(fake, capsys):
+    rc, d = run(fake, capsys, "swd-target", "cc35")
+    assert rc == 0 and d["swd_target"] == "cc35" and d["logger"] == 1 and fake.pins["SWD_SEL"] == [2, 1]
+    rc, d = run(fake, capsys, "swd-target", "e8")
+    assert d["swd_target"] == "e8" and fake.pins["SWD_SEL"][0] == 0
+    fake.cc35_powered = False
+    rc, d = run(fake, capsys, "swd-target", "cc35")
+    assert rc == 1 and d["error"] == "CC3501E not powered (LOGGER low)" and fake.pins["SWD_SEL"] == [0, 0]
+    assert run(fake, capsys, "swd-target", "status")[1]["swd_target"] == "e8"
+
+
+def test_eeprom_write_read_dump(fake, capsys, tmp_path):
+    data = bytes(range(200))
+    rc, d = run(fake, capsys, "eeprom", "write", "0x3F0", "--hex", data.hex())
+    assert rc == 0 and d["verified"] and fake.eeprom.mem[0x3F0:0x3F0 + 200] == data
+    writes = [r for r in fake.log if r[0] == 0x81 and r[1] == 0x50 and r[3] > 2]
+    for r in writes:  # each write stays inside one 64-byte page and one probe packet
+        a, n = r[5] << 8 | r[6], r[3] - 2
+        assert a // 64 == (a + n - 1) // 64 and n <= 57
+    assert set(fake.ee_seen) == {(2, 1)}  # POR held and bus linked for every access
+    assert fake.pins["MCU_RST_RP"][0] == 0 and fake.pins["I2C0_LINK_N"] == [0, 1]
+    rc, d = run(fake, capsys, "eeprom", "read", "0x3F0", "4")
+    assert d["data"] == "00010203"
+    out = tmp_path / "ee.bin"
+    rc, d = run(fake, capsys, "eeprom", "dump", "--out", str(out))
+    assert rc == 0 and out.read_bytes() == bytes(fake.eeprom.mem)
+    rc, d = run(fake, capsys, "eeprom", "read", "0x3FFF", "2")
+    assert rc == 1 and "outside" in d["error"]
+
+
+def test_eeprom_releases_on_error(fake, capsys):
+    fake.eeprom.busy_polls = 10 ** 6  # never finishes its write cycle
+    rc, d = run(fake, capsys, "eeprom", "write", "0", "--hex", "AA")
+    assert rc == 1 and "busy" in d["error"]
+    assert fake.pins["MCU_RST_RP"][0] == 0 and fake.pins["I2C0_LINK_N"] == [0, 1]
+    fake.eeprom.busy_polls = fake.eeprom.busy = 0
+    real = fake.eeprom.xfer
+    fake.eeprom.xfer = lambda w, n: real(w[:2] + bytes([0x55]) + w[3:], n) if len(w) > 2 else real(w, n)
+    rc, d = run(fake, capsys, "eeprom", "write", "0", "--hex", "AA")
+    assert rc == 1 and "verify failed at 0x0000" in d["error"]
+    assert fake.pins["MCU_RST_RP"][0] == 0 and fake.pins["I2C0_LINK_N"] == [0, 1]
+
+
+def test_cc35_info(fake, capsys):
+    rc, d = run(fake, capsys, "cc35", "info")
+    assert rc == 0 and d["idcode"] == 0x6BA02477 and d["udid"] == 0x5566778811223344
+    regs = d["config_ap"]
+    assert regs["CFGAPIDR"]["value"] == 0x102E0001 and regs["CFGAPIDR"]["fields"]["JEPIDS"] == 0x17
+    assert regs["CFGAPDEVID"]["fields"]["MAN"] == 0x17
+    assert regs["CFGAPBOOT"]["fields"]["PG_Version"] == 5 and regs["CFGAPBOOT"]["fields"]["Metal_Version"] == 4
+    assert regs["CFGAPBOOT"]["fields"]["Memory_Stacking"] == 2
+    assert fake.ap_writes == []
+    sels = {struct.unpack("<I", r[i + 1:i + 5])[0] for r in fake.log if r[0] == 0x05
+            for i in range(3, len(r) - 4) if r[i] == 0x08}
+    assert {0x00, 0x10, 0x20, 0xF0} <= sels
+    assert fake.log[-2][0] == 0x03 and fake.pins["SWD_SEL"][0] == 0  # disconnected, back to e8
+    # ABORT, SELECT 0 before the banked CTRL/STAT power-up request; never a CTRL/STAT power-down
+    assert fake.dp_writes[:3] == [(0x0, 0x1E), (0x8, 0), (0x4, 0x50000000)]
+    assert [w for w in fake.dp_writes if w[0] == 0x4] == [(0x4, 0x50000000)]
+    assert bytes([0x12, 136]) + b"\xff" * 7 + b"\x9e\xe7" + b"\xff" * 7 + b"\x00" in fake.log
+
+
+def test_cc35_abort_paths(fake, capsys):
+    fake.cc35_powered = False
+    rc, d = run(fake, capsys, "cc35", "info")
+    assert rc == 1 and "LOGGER low" in d["error"] and fake.pins["SWD_SEL"][0] == 0
+    assert not any(r[0] == 0x02 for r in fake.log)  # never connected
+    fake.cc35_powered, fake.cc35_fault = True, 0x14
+    rc, d = run(fake, capsys, "cc35", "info")
+    assert rc == 1 and "FAULT" in d["error"]
+    assert any(r[0] == 0x03 for r in fake.log) and fake.pins["SWD_SEL"][0] == 0
+
+
+def test_cc35_pwrup_ack_polled(fake, capsys):
+    fake.cc35_ack_delay = 3
+    rc, d = run(fake, capsys, "cc35", "info")
+    assert rc == 0 and fake.cc35_ack_delay == 0
+    fake.cc35_ack_delay = 10 ** 9
+    rc, d = run(fake, capsys, "cc35", "info")
+    assert rc == 1 and "not acknowledged" in d["error"] and fake.pins["SWD_SEL"][0] == 0

@@ -28,6 +28,11 @@ class Board:
     module_en: Optional[str] = None  # high = module held OFF
     module_stby: Optional[str] = None  # high = module standby asserted
     por: Optional[str] = None        # high = module POR_N held low
+    marker: Optional[str] = None     # default `stream --marker` pin
+    swd_sel: Optional[str] = None    # high = SWD + DAP nRESET to the CC3501E, release = E8
+    wifi_logger: Optional[str] = None  # input, reads 1 when the CC3501E is powered (while swd_sel high)
+    i2c0_link: Optional[str] = None  # low = RP I2C bus 0 joined to module I2C0 (EEPROM)
+    eeprom_addr: Optional[int] = None  # 7-bit, bus 0 while i2c0_link is low
 
     def monitor(self, ref):
         return next(m for m in self.monitors if m.ref == ref)
@@ -51,7 +56,7 @@ EVK_2641_R3 = Board(
         "BOOT2": "module BOOT2 (E2.U1) via 10k; not connected on the AEN R3 module",
         "BOOT3": "module BOOT3 (E2.V1) via 10k; not connected on the AEN R3 module",
         "MCU_RST_RP": "FET drive, active high: high pulls MCU_RST = module POR_N low (power-on reset)",
-        "MCU_RST_SENSE": "input: MCU_RST level (via 470k)",
+        "I2C0_LINK_N": "Q29 drive, 10k pull-up: release = bus 0 NOT joined to module I2C0, low = joined (EEPROM, TAS2563)",
         "MODULE_EN_RP": "FET drive, active high: high pulls MODULE_EN low = module held OFF",
         "MODULE_STBY_RP": "FET drive, active high: high pulls MODULE_STBY low = standby",
         "RTC_WAKE_N": "input: module RTC_WAKE_N (open drain, low = wake)",
@@ -60,11 +65,16 @@ EVK_2641_R3 = Board(
         "CURR_ALERT_N": "input: U29/U53 INA228 ALERT, low = alert",
         "PD_ACTIVE_N": "input: low = USB-PD contract supplying the board",
         "PWR_FLT_N": "input: low = eFuse fault",
+        "SWD_SEL": "U57 SEL, 100k pull-down: release = SWD + DAP nRESET to the E8, high = to the CC3501E",
+        "MARKER": "input: E8 pad E2.AG6 (target toggles it around each inference)",
+        "WIFI_LOGGER": "input: SWD_SEL high = CC3501E LOGGER (1 = CC3501E powered), SWD_SEL low = E8 TDO",
     },
     vio_adc=3, vio_div=2.0,  # ADC3 = VIO_OUT / 2 (R230 / R222 100k)
     module_ma="U29", module_ua="U53",
     range_pin="CURR_STATUS", range_sel="CURR_SEL",
     module_en="MODULE_EN_RP", module_stby="MODULE_STBY_RP", por="MCU_RST_RP",
+    marker="MARKER", swd_sel="SWD_SEL", wifi_logger="WIFI_LOGGER", i2c0_link="I2C0_LINK_N",
+    eeprom_addr=0x50,  # N24S128 (module U18): 1010 + A2..A0 factory default 0 (onsemi N24S128/D Rev. 3, Device Addressing)
 )
 
 GENERIC = Board(name="generic")

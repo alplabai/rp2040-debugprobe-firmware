@@ -3,7 +3,9 @@
 """alp-probe command line. Every command prints human-readable text, or exactly
 one JSON object on stdout with --json (errors: {"ok": false, "error": ...})."""
 import argparse
+import contextlib
 import json
+import struct
 import sys
 import time
 
@@ -19,6 +21,13 @@ POWER_WARN = "WARNING: these lines reset, power off or put the module into stand
 BUS1_HELP = ("I2C bus: 0 = power monitors (CURR_I2C, needs S6 on the RP2040), 1 = the module board I2C bus "
              "(GreenPAK, RTC, EEPROM), shared with the module SoC: use bus 1 only while the SoC is held in "
              "reset or is idle on that bus")
+XDS_WARN = "WARNING: never select cc35 while an XDS110 is connected to P19."
+CC35_UNPOWERED = "CC3501E not powered (LOGGER low)"
+
+# onsemi N24S128 (module U18 N24S128C4DYT3G), data sheet N24S128/D Rev. 3 (June 2025)
+N24S128_SIZE = 16384    # "Page Write": 16,384 bytes, 256 pages of 64 bytes, two byte address (Table 8)
+N24S128_PAGE = 64       # writes wrap within the 64-byte page
+N24S128_TWR_S = 0.005   # Table 6, tWR Write Cycle Time max 5 ms; "Acknowledge Polling": NACK while busy
 
 
 class CliError(Exception):
@@ -321,7 +330,7 @@ def cmd_stream(c, a):
     if not c.info["stream"] or c.info["version"] < 3:
         raise CliError(f"probe firmware (protocol v{c.info['version']}) has no v3 stream support; update it")
     ma, ua = b.monitor(b.module_ma), b.monitor(b.module_ua)
-    marker = P.MARKER_NONE
+    marker, a.marker = P.MARKER_NONE, a.marker or (b.marker if b.marker in c.pins else None)
     if a.marker:
         marker = c.pin_index(a.marker)
         c.pin_set(a.marker, "release")  # the sampler only reads the marker pin
@@ -377,6 +386,192 @@ def cmd_stream(c, a):
     return dict(summary=s), text
 
 
+# --- SWD target switch (U57 TMUX1574) -----------------------------------------
+def swd_select(c, target):
+    """target "e8" = release SWD_SEL, "cc35" = drive it high, then require LOGGER high.
+    Never leaves cc35 selected on failure."""
+    sel = c.need("swd_sel", "SWD target switch")
+    if target == "e8":
+        c.pin_set(sel, "release")
+        return None
+    try:
+        c.pin_set(sel, "high")
+        logger = c.pin_get(c.need("wifi_logger", "CC3501E LOGGER input"))[0]
+    except BaseException:
+        c.pin_set(sel, "release")
+        raise
+    if not logger:
+        c.pin_set(sel, "release")
+        raise CliError(CC35_UNPOWERED)
+    return logger
+
+
+def cmd_swd_target(c, a):
+    sel = c.need("swd_sel", "SWD target switch")
+    if a.target != "status":
+        swd_select(c, a.target)
+    lvl, mode = c.pin_get(sel)
+    out = dict(swd_target="cc35" if lvl else "e8", pin=sel, mode=mode)
+    if lvl:  # LOGGER is only routed to the probe while SWD_SEL is high
+        out["logger"] = c.pin_get(c.need("wifi_logger", "CC3501E LOGGER input"))[0]
+    return out, f"SWD target {out['swd_target']} ({sel} {mode})"
+
+
+# --- EEPROM on module I2C0 ------------------------------------------------------
+@contextlib.contextmanager
+def eeprom_bus(c):
+    """POR held (module SoC off the bus), bus 0 joined to module I2C0; both undone on any exit."""
+    por, link = c.need("por", "POR line"), c.need("i2c0_link", "module I2C0 link")
+    addr = c.need("eeprom_addr", "EEPROM")
+    c.pin_set(por, "high")
+    try:
+        c.pin_set(link, "low")
+        yield addr
+    finally:
+        try:
+            c.pin_set(link, "release")
+        finally:
+            c.pin_set(por, "release")
+
+
+def _ee_range(start, n):
+    if start < 0 or n < 0 or start + n > N24S128_SIZE:
+        raise CliError(f"EEPROM range 0x{start:04X}+{n} outside 0..0x{N24S128_SIZE:04X}")
+
+
+def ee_read(c, dev, start, n):
+    step, out = c.info["i2c_max"], b""
+    while len(out) < n:
+        a = start + len(out)
+        out += c.i2c(dev, struct.pack(">H", a), min(step, n - len(out)), restart=True)
+    return out
+
+
+def ee_write(c, dev, start, data):
+    step = c.info["i2c_max"] - 2  # 2 address bytes per transfer
+    done = 0
+    while done < len(data):
+        a = start + done
+        n = min(N24S128_PAGE - a % N24S128_PAGE, step, len(data) - done)
+        c.i2c(dev, struct.pack(">H", a) + data[done:done + n])
+        done += n
+        end = time.monotonic() + 4 * N24S128_TWR_S  # ACK polling, bounded by a few tWR
+        while True:
+            try:
+                c.i2c(dev, b"", 1)
+                break
+            except I2cError as e:
+                if e.status != 1 or time.monotonic() > end:
+                    raise CliError(f"EEPROM 0x{dev:02X} busy after write at 0x{a:04X}: {e}", status=e.status)
+    back = ee_read(c, dev, start, len(data))
+    bad = next((i for i in range(len(data)) if back[i] != data[i]), None)
+    if bad is not None:
+        raise CliError(f"EEPROM verify failed at 0x{start + bad:04X}: wrote {data[bad]:02X}, read {back[bad]:02X}")
+
+
+def cmd_eeprom(c, a):
+    if a.ecmd == "write":
+        data = bytes.fromhex(a.hex) if a.hex is not None else open(a.file, "rb").read()
+        _ee_range(a.addr, len(data))
+        with eeprom_bus(c) as dev:
+            ee_write(c, dev, a.addr, data)
+        return dict(addr=a.addr, len=len(data), verified=True), f"wrote and verified {len(data)} bytes at 0x{a.addr:04X}"
+    start, n = (0, N24S128_SIZE) if a.ecmd == "dump" else (a.addr, a.len)
+    _ee_range(start, n)
+    with eeprom_bus(c) as dev:
+        data = ee_read(c, dev, start, n)
+    out = dict(addr=start, len=n, out=a.out)
+    if a.out:
+        with open(a.out, "wb") as f:
+            f.write(data)
+        return out, f"read {n} bytes at 0x{start:04X} to {a.out}"
+    out["data"] = data.hex()
+    return out, data.hex()
+
+
+# --- CC3501E Config-AP (TI SWRU626 6.5 Table 6-1, 6.9 Table 6-3) ---------------
+CFG_APSEL = 0x0
+CFG_REGS = [("CFGAPDEVID", 0x00), ("CFGAPDEVUC", 0x04), ("DBGSSVER", 0x08), ("CFGAPBOOT", 0x10),
+            ("CFGAPLCST", 0x14), ("CFGAPUDID0", 0x28), ("CFGAPUDID1", 0x2C), ("CFGAPIDR", 0xFC)]
+# (field, hi, lo), from the SWRU626 6.9.x field tables
+FIELDS = {
+    "CFGAPDEVID": [("VER", 31, 28), ("PARTNUM", 27, 12), ("MAN", 11, 1), ("ALWAYSONE", 0, 0)],
+    "DBGSSVER": [("REVMAJ", 31, 28), ("REVMIN", 27, 24), ("PWRAP", 7, 7), ("SYSTEMAP", 6, 6), ("APBAP", 5, 5),
+                 ("SECAP", 4, 4), ("ETAP", 3, 3), ("ICEPICKM", 2, 2), ("TRIG", 1, 1), ("TRACE", 0, 0)],
+    # 6.9.4 DIAGVAL; 6.9.5 LCSVAL lists the same layout after "Life cycle state" (kept as printed)
+    "CFGAPBOOT": [("PG_Version", 3, 0), ("Metal_Version", 5, 3), ("Memory_Stacking", 8, 6), ("Package_type", 11, 9),
+                  ("Temperature", 13, 12), ("Device_PartNumber", 17, 14), ("Disable_5GHz", 18, 18),
+                  ("Disable_6GHz", 19, 19), ("Disable_BLE", 20, 20), ("Disable_BLE_M0+", 21, 21),
+                  ("Disable_CAN_FD", 22, 22), ("Boot_ROM_Version_FMU", 25, 23), ("Launch_pad_Mode", 26, 26),
+                  ("SDIO_Product_ID", 28, 27), ("TI_Fuse_ROM_Structure_Version", 31, 29)],
+    "CFGAPIDR": [("REV", 31, 28), ("JEPIDS", 27, 17), ("APCLASS", 16, 16), ("APVAR", 7, 4), ("APTYPE", 3, 0)],
+}
+FIELDS["CFGAPLCST"] = FIELDS["CFGAPBOOT"]
+CTRL_PWRUP_REQ, CTRL_PWRUP_ACK = 0x50000000, 0xA0000000  # ADIv5 CTRL/STAT C{SYS,DBG}PWRUP{REQ,ACK}
+TRANSFER_ACK = {P.T_WAIT: "WAIT", P.T_FAULT: "FAULT"}
+
+
+def decode_fields(name, v):
+    return {f: (v >> lo) & ((1 << (hi - lo + 1)) - 1) for f, hi, lo in FIELDS.get(name, [])}
+
+
+def _transfer(c, ops, what):
+    n, ack, vals = P.dec_transfer(c.x(P.enc_transfer(ops)))
+    if n != len(ops) or ack != P.T_OK:
+        raise CliError(f"SWD {what}: {n}/{len(ops)} done, ACK {TRANSFER_ACK.get(ack, f'0x{ack:X}')}", ack=ack)
+    return vals
+
+
+def _dap_ok(c, req, cmd, what):
+    if P.dec_status(c.x(req), cmd) != P.DAP_OK:
+        raise CliError(f"{what} failed")
+
+
+def cmd_cc35(c, a):
+    swd_select(c, "cc35")
+    sel = c.board.swd_sel
+    connected = False
+    try:
+        if P.dec_dap_connect(c.x(P.enc_dap_connect())) != P.DAP_PORT_SWD:
+            raise CliError("DAP_Connect: SWD port not available")
+        connected = True
+        _dap_ok(c, P.enc_swj_clock(1000000), P.DAP_SWJ_CLOCK, "DAP_SWJ_Clock")
+        # line reset (56 x 1), JTAG-to-SWD 0xE79E (LSB first), line reset, 8 idle cycles
+        _dap_ok(c, P.enc_swj_sequence(136, b"\xff" * 7 + b"\x9e\xe7" + b"\xff" * 7 + b"\x00"), P.DAP_SWJ_SEQUENCE,
+                "DAP_SWJ_Sequence")
+        _dap_ok(c, P.enc_transfer_configure(), P.DAP_TRANSFER_CONFIGURE, "DAP_TransferConfigure")
+        idcode = _transfer(c, [P.dp_read(P.DP_IDCODE)], "DP IDCODE")[0]
+        # clear sticky errors, SELECT 0 (CTRL/STAT is banked by DPBANKSEL, not reset by a line reset),
+        # request debug + system power-up (DP writes only), then poll for the ACKs (ADIv5: not immediate)
+        _transfer(c, [P.dp_write(P.DP_ABORT, 0x1E), P.dp_write(P.DP_SELECT, 0),
+                      P.dp_write(P.DP_CTRL_STAT, CTRL_PWRUP_REQ)], "DP power-up")
+        end = time.monotonic() + 0.1
+        while (ctrl := _transfer(c, [P.dp_read(P.DP_CTRL_STAT)], "DP CTRL/STAT")[0]) & CTRL_PWRUP_ACK != CTRL_PWRUP_ACK:
+            if time.monotonic() > end:
+                raise CliError(f"DP power-up not acknowledged (CTRL/STAT 0x{ctrl:08X})")
+        ops, bank = [], None
+        for _, reg in CFG_REGS:
+            if reg >> 4 != bank:
+                bank = reg >> 4
+                ops.append(P.dp_write(P.DP_SELECT, CFG_APSEL << 24 | bank << 4))
+            ops.append(P.ap_read(reg))
+        vals = _transfer(c, ops, "Config-AP read")
+    finally:
+        try:
+            if connected:
+                c.x(P.enc_dap_disconnect())  # power-up request left as is: another agent may hold it
+        finally:
+            c.pin_set(sel, "release")
+    regs = {name: dict(value=v, **({"fields": decode_fields(name, v)} if name in FIELDS else {}))
+            for (name, _), v in zip(CFG_REGS, vals)}
+    udid = regs["CFGAPUDID1"]["value"] << 32 | regs["CFGAPUDID0"]["value"]
+    lines = [f"DP IDCODE 0x{idcode:08X}", f"UDID 0x{udid:016X}"]
+    for name, r in regs.items():
+        f = r.get("fields")
+        lines.append(f"{name:10} 0x{r['value']:08X}" + (" " + " ".join(f"{k}={v}" for k, v in f.items()) if f else ""))
+    return dict(idcode=idcode, udid=udid, config_ap=regs), "\n".join(lines)
+
+
 # --- argument parsing ----------------------------------------------------------
 class Parser(argparse.ArgumentParser):
     def error(self, message):
@@ -427,14 +622,37 @@ def build_parser():
                             "Reconfigures the INA228 ADC_CONFIG and the bus 0 I2C speed.")
     st.add_argument("--period-us", type=int, default=1000, help="sample period, 200..10000000 (default 1000)")
     st.add_argument("--seconds", type=float, default=1.0, help="duration (default 1)")
-    st.add_argument("--marker", metavar="NAME", help="pin whose high level marks an energy window")
+    st.add_argument("--marker", metavar="NAME", help="pin whose high level marks an energy window (default: the board's MARKER pin, if any)")
     st.add_argument("--out", metavar="FILE", help="per-sample output, .csv or .jsonl")
     st.add_argument("--i2c-hz", type=int, default=400000, help="bus 0 speed while streaming (default 400000)")
+    sw = add(sub, "swd-target", "route SWD + DAP nRESET (SWD_SEL): e8 = release, cc35 = high, fails and returns "
+                                "to e8 when the CC3501E LOGGER reads low. " + XDS_WARN)
+    sw.add_argument("target", choices=["e8", "cc35", "status"])
+    ee = add(sub, "eeprom", f"module EEPROM (N24S128, {N24S128_SIZE} bytes, raw bytes). Holds POR (MCU_RST_RP high) "
+                            "and joins bus 0 to module I2C0 (I2C0_LINK_N low) for the access, then releases both. "
+                            + RESET_WARN)
+    es = ee.add_subparsers(dest="ecmd", required=True, metavar="ACTION")
+    num = lambda v: int(v, 0)
+    er = add(es, "read", "read LEN bytes at ADDR")
+    er.add_argument("addr", type=num)
+    er.add_argument("len", type=num)
+    er.add_argument("--out", metavar="FILE", help="write the bytes to FILE instead of printing hex")
+    ew = add(es, "write", "write bytes at ADDR (page-aligned, ACK polling, read-back verify)")
+    ew.add_argument("addr", type=num)
+    src = ew.add_mutually_exclusive_group(required=True)
+    src.add_argument("--hex", metavar="HEX")
+    src.add_argument("--file", metavar="FILE")
+    ed = add(es, "dump", "read the whole EEPROM")
+    ed.add_argument("--out", metavar="FILE", required=True)
+    cc = add(sub, "cc35", "CC3501E over SWD (read only). " + XDS_WARN)
+    cs = cc.add_subparsers(dest="ccmd", required=True, metavar="ACTION")
+    add(cs, "info", "select cc35, read DP IDCODE and the Config-AP (APSEL 0) registers, disconnect, select e8")
     return ap
 
 
 HANDLERS = dict(info=cmd_info, ports=cmd_ports, pin=cmd_pin, reset=cmd_reset, por=cmd_por, module=cmd_module,
-                i2c=cmd_i2c, vio=cmd_vio, range=cmd_range, power=cmd_power, stream=cmd_stream)
+                i2c=cmd_i2c, vio=cmd_vio, range=cmd_range, power=cmd_power, stream=cmd_stream,
+                **{"swd-target": cmd_swd_target, "eeprom": cmd_eeprom, "cc35": cmd_cc35})
 
 
 def main(argv=None, open_probe=None):

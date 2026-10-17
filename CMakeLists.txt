@@ -100,6 +100,12 @@ if (ALP_E1M_EVK)
     set_target_properties(debugprobe PROPERTIES
         OUTPUT_NAME "debugprobe_alp_e1m_evk"
     )
+    # PROBE_SERIAL_IN_FLASH: the USB serial record lives in the last flash sector.
+    target_link_libraries(debugprobe PRIVATE hardware_flash pico_rand)
+    # Implicit linker script (added to the default one): fails the link if the
+    # image reaches that sector.
+    target_link_options(debugprobe PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/serial_sector.ld)
+    set_property(TARGET debugprobe APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/src/serial_sector.ld)
 endif ()
 
 

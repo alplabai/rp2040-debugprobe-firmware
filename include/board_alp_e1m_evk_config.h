@@ -68,17 +68,21 @@
 // Stream record flags bit3: RP_CURR_STATUS (1 = mA range, 0 = uA range).
 #define PROBE_STREAM_AUX_GPIO 26
 
-// TDO_RP / TDI_RP: unused in SWD, input with pulls off.
-#define PROBE_RELEASE_GPIO_MASK ((1u << 18) | (1u << 19))
+// U54 MX25U1632F may not implement the 0x4B unique-ID read, so the USB serial
+// comes from a record in the last flash sector (generated on first boot).
+#define PROBE_SERIAL_IN_FLASH
 
 // All FET gates have external pull-downs: "released" = FET off = line not pulled.
+// I2C0_LINK_N (Q29) has a 10k pull-up instead: released = RP I2C bus 0 NOT joined
+// to module I2C0; low = joined. SWD_SEL (U57 SEL, 100k pull-down): released = SWD
+// and DAP nRESET to the E8, high = to the CC3501E.
 #define PROBE_PIN_TABLE { \
 	{13, "BOOT0", 0}, \
 	{12, "BOOT1", 0}, \
 	{11, "BOOT2", 0}, \
 	{10, "BOOT3", 0}, \
 	{8, "MCU_RST_RP", 0}, \
-	{9, "MCU_RST_SENSE", ALP_PIN_IN}, \
+	{9, "I2C0_LINK_N", 0}, \
 	{23, "MODULE_EN_RP", 0}, \
 	{22, "MODULE_STBY_RP", 0}, \
 	{7, "RTC_WAKE_N", ALP_PIN_IN}, \
@@ -87,6 +91,9 @@
 	{28, "CURR_ALERT_N", ALP_PIN_IN}, \
 	{14, "PD_ACTIVE_N", ALP_PIN_IN}, \
 	{15, "PWR_FLT_N", ALP_PIN_IN}, \
+	{27, "SWD_SEL", 0}, \
+	{19, "MARKER", ALP_PIN_IN}, \
+	{18, "WIFI_LOGGER", ALP_PIN_IN}, \
 }
 
 #define PROBE_PRODUCT_STRING "Alp Lab E1M EVK Probe (CMSIS-DAP)"
