@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `alp-probe slg dump|verify|program`: in-circuit NVM programming of the module
+  GreenPAK U1 (SLG46824V) over I2C bus 1 with the module held off; and
+  `alp-probe cc35 power on|off|status` through U1 register `0x7A`, holding the E8
+  in power-on reset while the CC3501E is provisioned.
 - Add the Alp Lab E1M-EVK 2641-R3 target (`-DALP_E1M_EVK=ON -DPICO_BOARD=alp_e1m_evk`,
   `debugprobe_alp_e1m_evk.uf2`): pico-sdk board file (MX25U1632F, generic_03h boot2),
   1.8 V pad voltage select, active-high DAP reset through an N-FET, 4 MHz SWCLK cap,

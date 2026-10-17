@@ -316,7 +316,23 @@ alp-probe pin list | reset pulse | por pulse | module off | i2c 0x52 --bus 1 --r
 alp-probe eeprom dump --out som.bin   # module EEPROM (raw bytes); holds the SoC in POR meanwhile
 alp-probe swd-target cc35|e8|status   # route SWD to the CC3501E (only when it is powered) or the E8
 alp-probe cc35 info                   # read-only CC3501E Config-AP: IDs, boot diag, lifecycle
+alp-probe cc35 power on|off|status    # CC3501E power through module GreenPAK U1 (E8 held in POR while on)
+alp-probe slg dump | verify IMG | program IMG [--soft-reset]   # module GreenPAK U1 NVM (module held off)
 ```
+
+CC3501E provisioning order: `cc35 power on`, then `swd-target cc35` (or
+`cc35 info`), then `swd-target e8` and `cc35 power off`. `cc35 power on` holds
+the E8 in power-on reset (`MCU_RST_RP` high) so the SoC firmware cannot rewrite
+U1 register `0x7A` meanwhile, re-arms `WIFI_ON` with a 0-to-1 edge and then sets
+`WIFI_RUN`; other bits of `0x7A` are kept.
+
+`slg` holds the module off (`MODULE_EN_RP` high), refuses while VIO_OUT reads
+above 0.3 V, finds U1 at `0x08` (or `0x00` when blank) on bus 1, refuses a
+protected part, erases only pages that need a 1-to-0 change, writes 16-byte
+pages and verifies all 256 bytes. It never sets the lock bit. `--soft-reset`
+reloads the NVM while the module is still held off; without it the image loads at
+the next board power-up. The image is the GreenPAK Designer "Export NVM" text and
+is not shipped in this repository.
 
 Every command takes `--json` and then prints exactly one JSON object, errors
 included (`{"ok": false, "error": ...}`, non-zero exit). `--serial` selects a

@@ -35,6 +35,29 @@ class FakeEeprom:
         return out
 
 
+class FakeSlg:
+    """SLG46824: register block 0 and NVM block 2 at one control code; erase clears a page, writes OR in bits."""
+    def __init__(self, ctrl=1):
+        self.ctrl, self.nvm, self.reg, self.writes = ctrl, bytearray(256), bytearray(256), []
+
+    def xfer(self, addr, w, rlen):
+        if addr >> 3 != self.ctrl:
+            return None
+        mem = self.nvm if addr & 7 == 2 else self.reg
+        a = w[0]
+        if len(w) > 1:
+            self.writes.append((addr & 7, a, bytes(w[1:])))
+            if mem is self.reg and a == 0xE3:
+                p = w[1] & 0xF
+                self.nvm[16 * p:16 * p + 16] = bytes(16)
+            elif mem is self.reg:
+                mem[a:a + len(w) - 1] = w[1:]
+            else:
+                for i, v in enumerate(w[1:]):
+                    mem[a + i] |= v
+        return bytes(mem[a:a + rlen])
+
+
 class FakeProbe:
     def __init__(self, board="alp-e1m-evk-2641-r3", version=3):
         self.board, self.version = board, version
@@ -56,6 +79,8 @@ class FakeProbe:
                         0x2C: 0x55667788, 0xFC: 0x102E0001}
         self.dp = {}
         self.ap_writes = []
+        self.slg = FakeSlg()
+        self.rails_stuck = False  # VIO_OUT stays up with MODULE_EN held low
 
     def xfer(self, req):
         req = bytes(req)
@@ -96,6 +121,9 @@ class FakeProbe:
         if cmd == 0x81:
             addr, flags, wlen, rlen = req[1:5]
             w, key = req[5:5 + wlen], (flags >> 1, addr)
+            if key[0] == 1 and addr >> 3 in (0, 1):
+                data = self.slg.xfer(addr, w, rlen)
+                return bytes([0x81, 1]) if data is None else bytes([0x81, 0]) + data
             if key == (0, EEPROM_ADDR) and self.pins["I2C0_LINK_N"][1] == 0:
                 self.ee_seen.append((self.pins["MCU_RST_RP"][0], self.pins["I2C0_LINK_N"][0]))
                 data = self.eeprom.xfer(w, rlen)
@@ -113,7 +141,8 @@ class FakeProbe:
         if cmd == 0x8A:
             if req[1] not in self.adc:
                 return bytes([0x8A, 1, 0, 0, 0, 0])
-            return bytes([0x8A, 0]) + struct.pack("<HH", self.adc[req[1]], 3300)
+            raw = 0 if req[1] == 3 and self.pins["MODULE_EN_RP"][1] == 1 and not self.rails_stuck else self.adc[req[1]]
+            return bytes([0x8A, 0]) + struct.pack("<HH", raw, 3300)
         if cmd in (0x86, 0x87, 0x88):
             return bytes([cmd, 0])
         if cmd == 0x89:

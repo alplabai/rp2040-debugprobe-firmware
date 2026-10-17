@@ -245,3 +245,51 @@ def test_cc35_pwrup_ack_polled(fake, capsys):
     fake.cc35_ack_delay = 10 ** 9
     rc, d = run(fake, capsys, "cc35", "info")
     assert rc == 1 and "not acknowledged" in d["error"] and fake.pins["SWD_SEL"][0] == 0
+
+
+def _image(tmp_path, data):
+    f = tmp_path / "u1_nvm.txt"
+    bits = [(data[i // 8] >> (i % 8)) & 1 for i in range(2048)]
+    f.write_text("index\t\tvalue\t\tcomment\r\n" + "".join(f"{i}\t\t{b}\t\t//\r\n" for i, b in enumerate(bits)))
+    return str(f)
+
+
+def test_slg_program_verify_dump(fake, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr("alp_probe.slg.T_WR", 0)
+    monkeypatch.setattr("alp_probe.cli.time.sleep", lambda s: None)
+    img = bytes((i * 37) & 0xFF for i in range(240)) + bytes(16)
+    fake.slg.ctrl = 0  # blank part answers at 0x00
+    rc, d = run(fake, capsys, "slg", "program", _image(tmp_path, img))
+    assert rc == 0 and d["addr"] == 0x00 and d["differs"] == [] and bytes(fake.slg.nvm) == img
+    assert fake.pins["MODULE_EN_RP"][0] == 0  # module released after
+    img2 = bytes(b ^ 0x0F for b in img[:240]) + img[240:]  # needs 1->0 changes: page erases
+    rc, d = run(fake, capsys, "slg", "program", _image(tmp_path, img2), "--soft-reset")
+    assert rc == 0 and bytes(fake.slg.nvm) == img2 and d["soft_reset"] and fake.slg.reg[0xC8] & 0x02
+    assert any(w[:2] == (0, 0xE3) for w in fake.slg.writes)
+    rc, d = run(fake, capsys, "slg", "verify", _image(tmp_path, img))
+    assert rc == 1 and d["differs"]
+    rc, d = run(fake, capsys, "slg", "dump")
+    assert rc == 0 and bytes.fromhex(d["nvm"]) == img2
+
+
+def test_slg_refuses_protected_and_rails_up(fake, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr("alp_probe.cli.time.sleep", lambda s: None)
+    fake.rails_stuck = True
+    rc, d = run(fake, capsys, "slg", "dump")
+    assert rc == 1 and "rails still up" in d["error"] and fake.pins["MODULE_EN_RP"][0] == 0
+    fake.rails_stuck = False
+    fake.slg.reg[0xE1] = 0x01
+    rc, d = run(fake, capsys, "slg", "program", _image(tmp_path, bytes(256)))
+    assert rc == 1 and "protected" in d["error"]
+
+
+def test_cc35_power(fake, capsys, monkeypatch):
+    monkeypatch.setattr("alp_probe.cli.time.sleep", lambda s: None)
+    fake.slg.reg[0x7A] = 0xC4  # WIFI_ON, WIFI_RUN and OSPI_ON set by the module firmware
+    rc, d = run(fake, capsys, "cc35", "power", "on")
+    assert rc == 0 and d["wifi_on"] and d["wifi_run"] and d["u1_0x7a"] == 0xC4
+    seq = [w[2][0] for w in fake.slg.writes if w[:2] == (0, 0x7A)]
+    assert seq == [0x04, 0x84, 0xC4]  # 0->1 edge on WIFI_ON, then WIFI_RUN; other bits kept
+    assert fake.pins["MCU_RST_RP"] == [2, 1]  # E8 held in reset
+    rc, d = run(fake, capsys, "cc35", "power", "off")
+    assert rc == 0 and d["u1_0x7a"] == 0x04 and fake.pins["MCU_RST_RP"][0] == 0

@@ -9,7 +9,7 @@ import struct
 import sys
 import time
 
-from . import boards, ina
+from . import boards, ina, slg
 from . import protocol as P
 from .transport import PID, VID, Probe, TransportError
 
@@ -19,7 +19,7 @@ S6_HINT = "NACK from a power monitor: switch S6 may be set to the module instead
 RESET_WARN = "WARNING: driving this line resets the module."
 POWER_WARN = "WARNING: these lines reset, power off or put the module into standby."
 BUS1_HELP = ("I2C bus: 0 = power monitors (CURR_I2C, needs S6 on the RP2040), 1 = the module board I2C bus "
-             "(GreenPAK, RTC, EEPROM), shared with the module SoC: use bus 1 only while the SoC is held in "
+             "(GreenPAK U1, RTC), shared with the module SoC: use bus 1 only while the SoC is held in "
              "reset or is idle on that bus")
 XDS_WARN = "WARNING: never select cc35 while an XDS110 is connected to P19."
 CC35_UNPOWERED = "CC3501E not powered (LOGGER low)"
@@ -528,6 +528,13 @@ def _dap_ok(c, req, cmd, what):
 
 
 def cmd_cc35(c, a):
+    if a.ccmd == "power":
+        if a.state == "status":
+            v = _u1_reg(c)
+        else:
+            v = cc35_power(c, a.state == "on")
+        out = dict(u1_0x7a=v, wifi_on=bool(v & WIFI_ON), wifi_run=bool(v & WIFI_RUN))
+        return out, f"U1 0x7A = 0x{v:02X}: WIFI_ON {int(out['wifi_on'])}, WIFI_RUN {int(out['wifi_run'])}"
     swd_select(c, "cc35")
     sel = c.board.swd_sel
     connected = False
@@ -570,6 +577,79 @@ def cmd_cc35(c, a):
         f = r.get("fields")
         lines.append(f"{name:10} 0x{r['value']:08X}" + (" " + " ".join(f"{k}={v}" for k, v in f.items()) if f else ""))
     return dict(idcode=idcode, udid=udid, config_ap=regs), "\n".join(lines)
+
+
+# --- module GreenPAK U1 (SLG46824V) on bus 1 ------------------------------------
+# AEN R3 module: U1 answers at control code 0001 (0x08); register 0x7A holds the virtual inputs.
+U1_CTRL_REG = 0x7A
+WIFI_ON, WIFI_RUN = 0x80, 0x40  # 0->1 on WIFI_ON arms Wi-Fi power; WIFI_RUN releases nRESET after a 5 ms hold
+WIFI_HOLD_S = 0.010             # U1 holds nRESET 5 ms after EN; wait twice that before WIFI_RUN
+VIO_OFF_V = 0.3                 # module rails counted as off below this VIO_OUT
+
+
+def _u1_xfer(c):
+    def xfer(addr, wr, rlen):
+        return c.i2c(addr, wr, rlen, restart=bool(rlen), bus=1)
+    return xfer
+
+
+@contextlib.contextmanager
+def module_held_off(c, settle_s=0.2):
+    """MODULE_EN held low (rails off, U1 alone on its private 3.3 V bus), released on any exit."""
+    pin = c.need("module_en", "module power control")
+    c.pin_set(pin, "high")
+    try:
+        time.sleep(settle_s)
+        v = cmd_vio(c, None)[0]["vio_v"]
+        if v > VIO_OFF_V:
+            raise CliError(f"module rails still up (VIO_OUT {v:.2f} V) with MODULE_EN held low")
+        yield
+    finally:
+        c.pin_set(pin, "release")
+
+
+def cmd_slg(c, a):
+    with module_held_off(c):
+        part = slg.Part(_u1_xfer(c), I2cError)
+        found = dict(addr=part.ctrl << 3)
+        if a.scmd == "dump":
+            d = part.read(slg.NVM, 0, 256)
+            return dict(found, nvm=d.hex()), "\n".join(d[i:i + 16].hex(" ") for i in range(0, 256, 16))
+        img = slg.load_image(open(a.image).read())
+        bad = slg.program(part, img, verify_only=a.scmd == "verify")
+        reset = not bad and getattr(a, "soft_reset", False)
+        if reset:
+            slg.soft_reset(part, I2cError)
+    out = dict(found, differs=bad, soft_reset=reset)
+    if bad:
+        raise CliError(f"GreenPAK NVM differs from the image on pages {bad}", **out)
+    return out, "GreenPAK NVM matches the image" + ("; soft reset done" if out["soft_reset"] else
+                                                     "; power-cycle the board (or --soft-reset) to load it")
+
+
+def _u1_reg(c):
+    return c.i2c(0x08, bytes([U1_CTRL_REG]), 1, restart=True, bus=1)[0]
+
+
+def _u1_write(c, v):
+    c.i2c(0x08, bytes([U1_CTRL_REG, v]), bus=1)
+
+
+def cc35_power(c, on):
+    por = c.need("por", "POR line")
+    if on:
+        c.pin_set(por, "high")  # E8 held in reset: off bus 1 and cannot rewrite 0x7A
+        v = _u1_reg(c) & ~(WIFI_ON | WIFI_RUN)
+        _u1_write(c, v)                       # WIFI_ON arms on a 0->1 edge only
+        _u1_write(c, v | WIFI_ON)
+        time.sleep(WIFI_HOLD_S)
+        _u1_write(c, v | WIFI_ON | WIFI_RUN)
+    else:
+        try:
+            _u1_write(c, _u1_reg(c) & ~(WIFI_ON | WIFI_RUN))
+        finally:
+            c.pin_set(por, "release")
+    return _u1_reg(c)
 
 
 # --- argument parsing ----------------------------------------------------------
@@ -647,12 +727,27 @@ def build_parser():
     cc = add(sub, "cc35", "CC3501E over SWD (read only). " + XDS_WARN)
     cs = cc.add_subparsers(dest="ccmd", required=True, metavar="ACTION")
     add(cs, "info", "select cc35, read DP IDCODE and the Config-AP (APSEL 0) registers, disconnect, select e8")
+    cp = add(cs, "power", "CC3501E power through module GreenPAK U1 register 0x7A (bus 1). on = hold the E8 in "
+                          "power-on reset (MCU_RST_RP high), re-arm WIFI_ON, then WIFI_RUN; off = clear both and "
+                          "release the E8. " + RESET_WARN)
+    cp.add_argument("state", choices=["on", "off", "status"])
+    sg = add(sub, "slg", "module GreenPAK U1 (SLG46824V) NVM over bus 1. Holds the module off (MODULE_EN_RP high) "
+                         "and checks VIO_OUT is below 0.3 V first, releases it after. The image is GreenPAK Designer "
+                         "'Export NVM' text. " + POWER_WARN)
+    ss = sg.add_subparsers(dest="scmd", required=True, metavar="ACTION")
+    add(ss, "dump", "print the 256 NVM bytes")
+    sv = add(ss, "verify", "compare the NVM with an image")
+    sv.add_argument("image")
+    sp = add(ss, "program", "erase only the pages that need it, write, verify. Never sets the lock bit.")
+    sp.add_argument("image")
+    sp.add_argument("--soft-reset", action="store_true",
+                    help="reload the NVM (register bit 1601) while the module is still held off")
     return ap
 
 
 HANDLERS = dict(info=cmd_info, ports=cmd_ports, pin=cmd_pin, reset=cmd_reset, por=cmd_por, module=cmd_module,
                 i2c=cmd_i2c, vio=cmd_vio, range=cmd_range, power=cmd_power, stream=cmd_stream,
-                **{"swd-target": cmd_swd_target, "eeprom": cmd_eeprom, "cc35": cmd_cc35})
+                slg=cmd_slg, **{"swd-target": cmd_swd_target, "eeprom": cmd_eeprom, "cc35": cmd_cc35})
 
 
 def main(argv=None, open_probe=None):
@@ -663,7 +758,7 @@ def main(argv=None, open_probe=None):
         a.serial = getattr(a, "serial", None)
         c = Ctx(a.serial, open_probe or (lambda s: Probe(serial=s)))
         data, text = HANDLERS[a.cmd](c, a)
-    except (CliError, TransportError, P.ProtocolError, ValueError, OSError) as e:
+    except (CliError, slg.SlgError, TransportError, P.ProtocolError, ValueError, OSError) as e:
         if as_json:
             print(json.dumps(dict(ok=False, error=str(e), **getattr(e, "extra", {}))))
         else:
