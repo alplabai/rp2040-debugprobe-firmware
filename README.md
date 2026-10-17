@@ -50,16 +50,15 @@ control as CMSIS-DAP vendor commands (request IDs `0x80`..`0x9F`, implemented
 in `src/alp_vendor.c`). They travel over the existing CMSIS-DAP v2 bulk
 interface (interface 0); there is no extra USB interface. The firmware is
 chip-agnostic: the host decodes whatever current-sense chip is on the I2C bus.
-`tools/alp_probe.py` is a host example (`--selftest` checks the encoders against
-the tables below).
+The host tool in [`host/`](#host-tool) implements every command below.
 
 All multi-byte values are little-endian. Every response starts with the request
 ID. A request is one DAP packet (`DAP_PACKET_SIZE` = 64 bytes), sent standalone.
-Unknown IDs in `0x8A`..`0x9F` reply with the single byte `0xFF` (`ID_DAP_Invalid`).
+Unknown IDs in `0x8C`..`0x9F` reply with the single byte `0xFF` (`ID_DAP_Invalid`).
 
 | ID | Name | Request (after ID) | Response (after ID) |
 |---:|---|---|---|
-| `0x80` | `ALP_INFO` | none | `version` u8 (= 2), `features` u8 (bit0 I2C, bit1 GPIO, bit2 STREAM), `npins` u8, `i2c_max` u8 |
+| `0x80` | `ALP_INFO` | none | `version` u8 (= 3), `features` u8 (bit0 I2C bus 0, bit1 GPIO, bit2 STREAM, bit3 I2C bus 1, bit4 ADC, bit5 BOARD), `npins` u8, `i2c_max` u8 |
 | `0x81` | `ALP_I2C_XFER` | `addr7` u8, `flags` u8, `wlen` u8, `rlen` u8, `wdata[wlen]` | `status` u8, then `rdata[rlen]` only when `status` = 0 |
 | `0x82` | `ALP_I2C_CONFIG` | `hz` u32 | `actual_hz` u32 |
 | `0x83` | `ALP_PIN_SET` | `index` u8, `mode` u8 | `status` u8, `level` u8 |
@@ -69,14 +68,16 @@ Unknown IDs in `0x8A`..`0x9F` reply with the single byte `0xFF` (`ID_DAP_Invalid
 | `0x87` | `ALP_STREAM_START` | none | `status` u8 |
 | `0x88` | `ALP_STREAM_STOP` | none | `status` u8 (always 0) |
 | `0x89` | `ALP_STREAM_READ` | none | `status` u8, `count` u8, `recsize` u8, `dropped` u32, then `count` x record |
+| `0x8A` | `ALP_ADC_READ` | `chan` u8 (0..3 = ADC0..ADC3 = GPIO26..29) | `status` u8, `raw` u16, `vref_mv` u16 |
+| `0x8B` | `ALP_BOARD` | none | `len` u8, `name[len]` ASCII |
 
 **`ALP_INFO`**: `npins` counts the pins that survived the boot-time check
 (below). `i2c_max` is the largest `wlen` and `rlen` accepted (`DAP_PACKET_SIZE`
 - 5 = 59), 0 when the board has no I2C. A board with neither I2C nor pins reports
 `features` = 0.
 
-**`ALP_I2C_XFER`**: `flags` bit0 = write-then-read with a repeated start; all
-other bits must be 0. Without bit0 a write and a read are separate transactions
+**`ALP_I2C_XFER`**: `flags` bit0 = write-then-read with a repeated start; bit1
+selects I2C bus 1 (status 4 when the board has none); all other bits must be 0. Without bit0 a write and a read are separate transactions
 (each ends with STOP); `wlen` = 0 gives a read only, `rlen` = 0 a write only.
 `wlen` and `rlen` both 0 is rejected, as is bit0 with either 0.
 
@@ -89,9 +90,17 @@ other bits must be 0. Without bit0 a write and a read are separate transactions
 | 4 | I2C not available on this board |
 | 5 | busy: a stream is running (see below) |
 
+**`ALP_ADC_READ`**: `raw` is the 12-bit mean of 16 conversions, `vref_mv` the
+board's ADC reference (`PROBE_ADC_VREF_MV`). `status` 1 = channel not available on
+this board (`raw` and `vref_mv` 0). Volts at the pin = `raw` / 4095 x `vref_mv`.
+
+**`ALP_BOARD`**: the board name (`PROBE_BOARD_NAME`, default `generic`). The host
+selects its board profile (monitors, pin meanings) from it.
+
 **`ALP_I2C_CONFIG`**: `hz` is clamped to 10000..1000000; the reply is the baud
 rate the hardware actually got (`i2c_set_baudrate`), or 0 when I2C is not
-available or a stream is running (this reply has no status byte). The boot speed is the board's `PROBE_I2C_BAUDRATE` (default 100000).
+available or a stream is running (this reply has no status byte). `hz` bit31
+selects bus 1 (bits 0..30 are the frequency); the busy rule applies to bus 0 only. The boot speed is the board's `PROBE_I2C_BAUDRATE` (default 100000).
 
 ### Power/energy stream (`0x86`..`0x89`)
 
@@ -123,7 +132,7 @@ samples discarded since START because the ring was full (wraps at 2^32).
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 4 | `timestamp_us` u32, `time_us_32()` at the start of the sample (wraps every 71.6 min) |
-| 4 | 1 | `flags`: bit0 marker level (`gpio_get` of the marker pin, 0 without a marker), bit1 an I2C error occurred in this sample (that channel's bytes are 0), bit2 one or more samples were dropped immediately before this record |
+| 4 | 1 | `flags`: bit0 marker level (`gpio_get` of the marker pin, 0 without a marker), bit1 an I2C error occurred in this sample (that channel's bytes are 0), bit2 one or more samples were dropped immediately before this record, bit3 level of the board's `PROBE_STREAM_AUX_GPIO` (0 without one; EVK: current range, 1 = mA) |
 | 5 | `recsize` - 5 | channel bytes, concatenated in configuration order, as read from the chip |
 
 **Busy rule:** from START until STOP completes, `ALP_I2C_XFER` answers status 5
@@ -166,8 +175,9 @@ and integrates power between marker edges using the timestamps.
 
 **Pins**: `index` is the position in the board pin table (0..`npins`-1), not a
 GPIO number. Names are discovered with `ALP_PIN_INFO`; `flags` bit0 = the pin's
-boot default is not "released". `status`: 0 OK, 1 bad index (every index on a
-board without a table), 2 bad mode (`ALP_PIN_SET` only). On a non-zero status the
+boot default is not "released", bit1 = input only (the far end drives the line).
+`status`: 0 OK, 1 bad index (every index on a board without a table), 2 bad mode
+(`ALP_PIN_SET` only; also drive low/high on an input-only pin). On a non-zero status the
 remaining response bytes are 0 (`ALP_PIN_INFO`: `flags` = 0, `namelen` = 0).
 `level` is the pad level read back after the change.
 
@@ -188,7 +198,8 @@ I2C is enabled by `PROBE_I2C_INTERFACE`, `PROBE_I2C_SDA`, `PROBE_I2C_SCL` and
 (optionally, default 100000) `PROBE_I2C_BAUDRATE` in the board header;
 `PROBE_I2C_INTERNAL_PULLUP` additionally enables the RP2040 internal pull-ups for
 bare dev boards. The pin table is
-`#define PROBE_PIN_TABLE { {gpio, "NAME", default_mode}, ... }`. Names are
+`#define PROBE_PIN_TABLE { {gpio, "NAME", default_mode}, ... }`; `default_mode`
+`ALP_PIN_IN` marks an input-only pin (boots released, never driven). Names are
 1..32 ASCII characters. A board defining neither still builds; I2C commands then
 answer status 4 and pin commands status 1.
 
@@ -197,6 +208,12 @@ build time. Table entries are checked at boot, and an entry on any of those pins
 the I2C pins, a duplicate GPIO, a bad GPIO number, a bad default mode or a bad
 name is dropped, so host tooling can never drive the probe's own interfaces.
 
+Other board options: `PROBE_I2C1_INTERFACE`/`_SDA`/`_SCL`/`_BAUDRATE` (bus 1),
+`PROBE_ADC_CHANNELS` (bitmask) + `PROBE_ADC_VREF_MV`, `PROBE_STREAM_AUX_GPIO`,
+`PROBE_BOARD_NAME`, `PROBE_PADS_1V8` (pad VOLTAGE_SELECT = 1.8 V for IOVDD = 1.8 V),
+`PROBE_RELEASE_GPIO_MASK` (inputs with pulls off at boot), `PROBE_RESET_ACTIVE_HIGH`
+(reset through an N-FET: GPIO high = nRESET asserted) and `PROBE_SWCLK_MAX_KHZ`.
+
 ## Supported boards
 
 | Board header | Target | Channels |
@@ -204,9 +221,51 @@ name is dropped, so host tooling can never drive the probe's own interfaces.
 | `include/board_pico_config.h` | Raspberry Pi Pico (`-DDEBUG_ON_PICO=ON`) | CDC0 UART0 (GP12 TX / GP13 RX), CDC1 UART1 (GP8 TX / GP9 RX); vendor I2C0 (GP16 SDA / GP17 SCL), pins `DEMO_A` GP20, `DEMO_B` GP21 (dev only) |
 | `include/board_debug_probe_config.h` | Raspberry Pi Debug Probe hardware | CDC0 only, UART1 (GP4 TX / GP5 RX); channel 1 disabled (single UART connector); no vendor I2C or pins |
 
-A `board_alp_e1m_evk_config.h` will be added once the schematic of the E1M EVK
-board revision carrying the RP2040 is fixed. Until then there is no Alp Lab EVK
-board config and no EVK pin assignment in this repository.
+| `include/board_alp_e1m_evk_config.h` | Alp Lab E1M-EVK 2641-R3 (`-DALP_E1M_EVK=ON -DPICO_BOARD=alp_e1m_evk`) | CDC0 SE-UART UART1 (GPIO4 TX / GPIO5 RX), CDC1 console UART0 (GPIO0 TX / GPIO1 RX); I2C bus 0 power monitors, I2C bus 1 module board bus; ADC3 VIO sense; pin table below |
+
+### E1M-EVK 2641-R3
+
+RP2040 U55, IOVDD = 1.8 V (GPIO are not 3.3 V tolerant), flash U54 MX25U1632F
+(1.8 V, boot2 `generic_03h`), 12 MHz crystal. SWD, UARTs and `RTC_WAKE_N` reach
+the module through U3 TXS0108E (1.8 V to +VIO_SW, enabled by VIO_PG), so SWCLK is
+capped at 4 MHz. Board name `alp-e1m-evk-2641-r3`.
+
+| GPIO | Function |
+|---:|---|
+| 16 / 17 | SWDIO / SWCLK (shared with J2) |
+| 20 | DAP nRESET: Q16 pulls `JTAG_RST` (module E.NSRST, J2.10) low when high |
+| 4 / 5 | UART1 TX / RX = CDC0 SE-UART (module SEUART on E2.AE3 / E2.AD3) |
+| 0 / 1 | UART0 TX / RX = CDC1 app console (module UART0 pads via S7) |
+| 24 / 25 | I2C bus 0 SDA / SCL: power monitors on CURR_I2C (switch S6 to the RP2040) |
+| 2 / 3 | I2C bus 1 SDA / SCL: module board bus (GreenPAK, RTC, EEPROM) via U14 |
+| 29 | ADC3 = VIO_OUT / 2 |
+| 21 | status LED (USB connected) |
+| 18 / 19 | TDO / TDI, unused in SWD, released |
+
+Pin table (index, name, GPIO, meaning). All boot released; every FET gate has an
+external pull-down, so released = FET off.
+
+| # | Name | GPIO | Meaning |
+|---:|---|---:|---|
+| 0..3 | `BOOT0`..`BOOT3` | 13, 12, 11, 10 | module boot straps via 10k (not connected on AEN R3) |
+| 4 | `MCU_RST_RP` | 8 | high = Q17 pulls `MCU_RST` (E.POR_N) low |
+| 5 | `MCU_RST_SENSE` | 9 | input only: `MCU_RST` level (R254 470k) |
+| 6 | `MODULE_EN_RP` | 23 | high = Q18 pulls `MODULE_EN` low: module OFF |
+| 7 | `MODULE_STBY_RP` | 22 | high = Q15 pulls `MODULE_STBY` low |
+| 8 | `RTC_WAKE_N` | 7 | input only: module RTC wake (open-drain) |
+| 9 | `CURR_SEL` | 6 | high then release = select the 5 V module uA range |
+| 10 | `CURR_STATUS` | 26 | input only: 1 = mA range, 0 = uA range (also stream flag bit3) |
+| 11 | `CURR_ALERT_N` | 28 | input only: U29/U53 INA228 ALERT |
+| 12 | `PD_ACTIVE_N` | 14 | input only: 0 = USB-PD contract powers the board |
+| 13 | `PWR_FLT_N` | 15 | input only: 0 = eFuse U9/U12 fault |
+
+The 5 V module current range returns from uA to mA only by the hardware trip
+(about 4 mA through R278) or a power cycle; there is no firmware path back.
+The EVK has no dedicated module-to-RP2040 marker line for per-inference windowing.
+
+**Warning:** `MODULE_EN_RP`, `MCU_RST_RP` and DAP nRESET power off or reset the
+module. I2C bus 1 is shared with the module SoC; use it only while the SoC is held
+in reset or idle on that bus.
 
 ## Build
 
@@ -222,10 +281,34 @@ cmake -G Ninja -S . -B build && ninja -C build
 
 # Raspberry Pi Pico -> build-pico/debugprobe_on_pico.uf2
 cmake -G Ninja -S . -B build-pico -DDEBUG_ON_PICO=ON -DPICO_BOARD=pico && ninja -C build-pico
+
+# Alp Lab E1M EVK -> build-evk/debugprobe_alp_e1m_evk.uf2
+cmake -G Ninja -S . -B build-evk -DALP_E1M_EVK=ON -DPICO_BOARD=alp_e1m_evk && ninja -C build-evk
 ```
 
-Both targets must build warning-free (`-Wall`). Load a `.uf2` through the RP2040
+All targets must build warning-free (`-Wall`). Load a `.uf2` through the RP2040
 UF2 bootloader.
+
+## Host tool
+
+`host/` is the Python host tool (`alp-probe`), used from a shell and from VS Code:
+
+```sh
+pip install -e host            # pyusb + pyserial; tests: pip install -e "host[test]" && pytest host
+alp-probe info                 # probe, firmware, board
+alp-probe ports                # SE-UART and app console serial devices
+alp-probe power                # one reading of every monitor on the board
+alp-probe range ua             # 5 V module uA range
+alp-probe stream --seconds 5 --marker NAME --out run.csv   # streamed 5 V module power, energy summary
+alp-probe pin list | reset pulse | por pulse | module off | i2c 0x50 --bus 1 --read 8 | vio
+```
+
+Every command takes `--json` and then prints exactly one JSON object, errors
+included (`{"ok": false, "error": ...}`, non-zero exit). `--serial` selects a
+probe. Current is the shunt voltage divided by the board's shunt value; register
+LSBs follow TI SBOSA81D (INA236) and SLYS021A (INA228). `stream` sets the INA228
+ADC timing for the period and restores the power-on `ADC_CONFIG` afterwards. On
+Linux the probe needs a udev rule for `2e8a:000c`.
 
 ## Upstream tracking
 
@@ -242,4 +325,7 @@ UF2 bootloader.
 ## Status
 
 USB enumeration of the two-channel layout is built and descriptor-checked but
-has not been verified on RP2040 hardware yet.
+has not been verified on RP2040 hardware yet. The E1M EVK target builds but has
+not run on an EVK 2641-R3 yet. To check on first boards: the USB serial number
+(derived from the flash unique ID, command `0x4B`; if U54 does not support it,
+every EVK probe reports the same serial) and the 12 MHz crystal start-up.

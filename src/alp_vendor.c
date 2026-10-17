@@ -3,13 +3,14 @@
  * Copyright (c) 2026 Alp Lab AB
  */
 
-// CMSIS-DAP vendor commands 0x80..0x9F: raw I2C transfers and named GPIO
-// control. Layout is documented in README.md ("Vendor commands").
+// CMSIS-DAP vendor commands 0x80..0x9F: raw I2C transfers, named GPIO
+// control, ADC and board name. Layout is documented in README.md ("Vendor commands").
 //
 // Threading: DAP_ProcessVendorCommand runs in the DAP thread (core 1). The only
-// other user of the I2C peripheral is the stream sampler task (core 0, see
-// "Stream"); the two are mutually exclusive: while a stream runs 0x81/0x82
-// answer busy, and STOP/CONFIG wait until the sampler has parked. Table pins are
+// other user of I2C bus 0 is the stream sampler task (core 0, see "Stream");
+// the two are mutually exclusive: while a stream runs 0x81/0x82 on bus 0
+// answer busy, and STOP/CONFIG wait until the sampler has parked. Bus 1 and the
+// ADC are used by the DAP thread only. Table pins and PROBE_STREAM_AUX_GPIO are
 // only read (gpio_get) by the sampler.
 
 #include <string.h>
@@ -19,6 +20,7 @@
 #include "task.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include "hardware/adc.h"
 
 #include "DAP_config.h"
 #include "DAP.h"
@@ -33,6 +35,29 @@
 #else
 #define ALP_HAVE_I2C 0
 #endif
+
+#if defined(PROBE_I2C1_INTERFACE) && defined(PROBE_I2C1_SDA) && defined(PROBE_I2C1_SCL)
+#define ALP_HAVE_I2C1 1
+#ifndef PROBE_I2C1_BAUDRATE
+#define PROBE_I2C1_BAUDRATE 100000
+#endif
+#else
+#define ALP_HAVE_I2C1 0
+#endif
+
+#ifndef PROBE_BOARD_NAME
+#define PROBE_BOARD_NAME "generic"
+#endif
+
+// PROBE_ADC_CHANNELS: bit n = ADCn (GPIO ADC_BASE_PIN + n) is available.
+#ifndef PROBE_ADC_CHANNELS
+#define PROBE_ADC_CHANNELS 0
+#define PROBE_ADC_VREF_MV 0
+#endif
+#ifndef PROBE_ADC_VREF_MV
+#error "alp_vendor: PROBE_ADC_CHANNELS needs PROBE_ADC_VREF_MV"
+#endif
+_Static_assert((PROBE_ADC_CHANNELS) <= 0xF, "alp_vendor: PROBE_ADC_CHANNELS has bits beyond ADC3");
 
 #ifdef PROBE_PIN_TABLE
 static const struct alp_pin_def board_pins[] = PROBE_PIN_TABLE;
@@ -84,12 +109,44 @@ enum {
 #endif
 };
 
+// Pins owned by the vendor peripherals. Table pins must not overlap these either.
+enum {
+	ALP_I2C0_PINS = 0
 #if ALP_HAVE_I2C
-// Compile-time: the I2C pins must not collide with the probe's own pins.
-_Static_assert(PROBE_I2C_SDA != PROBE_I2C_SCL, "alp_vendor: I2C SDA == SCL");
-_Static_assert(!(ALP_RESERVED & ((1 << PROBE_I2C_SDA) | (1 << PROBE_I2C_SCL))),
-               "alp_vendor: I2C pin collides with a probe pin");
+	| (1 << PROBE_I2C_SDA) | (1 << PROBE_I2C_SCL)
 #endif
+	,
+	ALP_I2C1_PINS = 0
+#if ALP_HAVE_I2C1
+	| (1 << PROBE_I2C1_SDA) | (1 << PROBE_I2C1_SCL)
+#endif
+	,
+	ALP_ADC_PINS = (PROBE_ADC_CHANNELS) << ADC_BASE_PIN,
+};
+
+// Compile-time: the I2C and ADC pins must not collide with the probe's own pins
+// or with each other.
+#if ALP_HAVE_I2C
+_Static_assert(PROBE_I2C_SDA != PROBE_I2C_SCL, "alp_vendor: I2C SDA == SCL");
+_Static_assert(!(ALP_RESERVED & ALP_I2C0_PINS), "alp_vendor: I2C pin collides with a probe pin");
+#endif
+#if ALP_HAVE_I2C1
+_Static_assert(PROBE_I2C1_SDA != PROBE_I2C1_SCL, "alp_vendor: I2C1 SDA == SCL");
+_Static_assert(!((ALP_RESERVED | ALP_I2C0_PINS) & ALP_I2C1_PINS),
+               "alp_vendor: I2C1 pin collides with a probe or I2C pin");
+#endif
+_Static_assert(!((ALP_RESERVED | ALP_I2C0_PINS | ALP_I2C1_PINS) & ALP_ADC_PINS),
+               "alp_vendor: ADC channel GPIO collides with a probe or I2C pin");
+#ifdef PROBE_RELEASE_GPIO_MASK
+_Static_assert(!((ALP_RESERVED | ALP_I2C0_PINS | ALP_I2C1_PINS | ALP_ADC_PINS) & (PROBE_RELEASE_GPIO_MASK)),
+               "alp_vendor: PROBE_RELEASE_GPIO_MASK covers a probe, I2C or ADC pin");
+#endif
+#ifdef PROBE_STREAM_AUX_GPIO
+// Only read by the sampler, so it may be a table pin; ADC pins have the digital input off.
+_Static_assert(PROBE_STREAM_AUX_GPIO < NUM_BANK0_GPIOS && !(ALP_ADC_PINS & (1 << PROBE_STREAM_AUX_GPIO)),
+               "alp_vendor: bad PROBE_STREAM_AUX_GPIO");
+#endif
+_Static_assert(sizeof(PROBE_BOARD_NAME) - 1 <= DAP_PACKET_SIZE - 2, "alp_vendor: PROBE_BOARD_NAME too long");
 
 // Packet limits (standalone command, not inside DAP_ExecuteCommands).
 // Request: cmd, addr, flags, wlen, rlen + wdata. Response: cmd, status + rdata.
@@ -160,33 +217,74 @@ void alp_vendor_init(void)
 #endif
 	stream_init();
 #endif
+#if ALP_HAVE_I2C1
+	i2c_init(PROBE_I2C1_INTERFACE, PROBE_I2C1_BAUDRATE);
+	gpio_set_function(PROBE_I2C1_SDA, GPIO_FUNC_I2C);
+	gpio_set_function(PROBE_I2C1_SCL, GPIO_FUNC_I2C);
+#endif
+#if PROBE_ADC_CHANNELS
+	adc_init();
+	for (unsigned c = 0; c < 4; c++)
+		if ((PROBE_ADC_CHANNELS) & (1u << c))
+			adc_gpio_init(ADC_BASE_PIN + c); // input buffer and pulls off
+#endif
+#if defined(PROBE_PIN_RESET) && defined(PROBE_RESET_ACTIVE_HIGH)
+	// Push-pull reset is a SIO output from boot (low = released), so
+	// DAP_SWJ_Pins drives it without a DAP_Connect.
+	gpio_init(PROBE_PIN_RESET);
+	gpio_set_dir(PROBE_PIN_RESET, GPIO_OUT);
+#endif
+#ifdef PROBE_RELEASE_GPIO_MASK
+	// Board-connected inputs nobody claims: input, pulls off (the reset default
+	// pull-down would load the board's pull-ups).
+	for (unsigned g = 0; g < NUM_BANK0_GPIOS; g++) {
+		if ((PROBE_RELEASE_GPIO_MASK) & (1u << g)) {
+			gpio_init(g);
+			gpio_disable_pulls(g);
+		}
+	}
+#endif
 
 	// Boot-time check: drop entries that would let the host drive the probe's own
 	// pins, bad GPIO numbers, bad modes, duplicates and over-long names.
 	for (unsigned i = 0; i < ALP_BOARD_PINS && npins < 255; i++) {
 #ifdef PROBE_PIN_TABLE
 		const struct alp_pin_def *d = &board_pins[i];
-		if (d->gpio >= NUM_BANK0_GPIOS || d->mode >= ALP_PIN_MODE_COUNT || !d->name ||
+		bool in_only = d->mode == ALP_PIN_IN;
+		uint8_t mode = in_only ? ALP_PIN_RELEASE : d->mode;
+		if (d->gpio >= NUM_BANK0_GPIOS || mode >= ALP_PIN_MODE_COUNT || !d->name ||
 		    strlen(d->name) > PIN_NAME_MAX || (d->name[0] == 0))
 			continue;
 		uint32_t bit = 1u << d->gpio;
-		if ((bit & (uint32_t)ALP_RESERVED) || (bit & seen))
+		if ((bit & (uint32_t)(ALP_RESERVED | ALP_I2C0_PINS | ALP_I2C1_PINS | ALP_ADC_PINS)) ||
+		    (bit & seen))
 			continue;
-#if ALP_HAVE_I2C
-		if (d->gpio == PROBE_I2C_SDA || d->gpio == PROBE_I2C_SCL)
-			continue;
-#endif
 		seen |= bit;
 		pins[npins].gpio = d->gpio;
 		pins[npins].name = d->name;
-		pins[npins].flags = d->mode != ALP_PIN_RELEASE; // bit0: boot default is not "released"
-		pin_apply(npins, d->mode);
+		// bit0: boot default is not "released"; bit1: input only
+		pins[npins].flags = (mode != ALP_PIN_RELEASE) | (in_only << 1);
+		pin_apply(npins, mode);
 		npins++;
 #endif
 	}
 }
 
+// flags bit1 (0x81) / hz bit31 (0x82) select bus 1. NULL: that bus is not on this board.
+static i2c_inst_t *i2c_bus(bool bus1)
+{
+	if (bus1) {
+#if ALP_HAVE_I2C1
+		return PROBE_I2C1_INTERFACE;
+#endif
+	} else {
 #if ALP_HAVE_I2C
+		return PROBE_I2C_INTERFACE;
+#endif
+	}
+	return NULL;
+}
+
 static uint8_t i2c_status(int rc, size_t want)
 {
 	if ((size_t)rc == want)
@@ -194,7 +292,7 @@ static uint8_t i2c_status(int rc, size_t want)
 	return rc == PICO_ERROR_TIMEOUT ? I2C_TIMEOUT : I2C_NACK;
 }
 
-static uint32_t cmd_i2c_xfer(const uint8_t *req, uint8_t *resp)
+static uint32_t cmd_i2c_xfer(const uint8_t *req, uint8_t *resp, i2c_inst_t *bus)
 {
 	uint8_t addr = req[1], flags = req[2], wlen = req[3], rlen = req[4];
 	uint32_t consumed = I2C_REQ_HDR + wlen;
@@ -204,19 +302,19 @@ static uint32_t cmd_i2c_xfer(const uint8_t *req, uint8_t *resp)
 		consumed = DAP_PACKET_SIZE;
 	resp[1] = I2C_BAD_LEN;
 
-	if (addr < 0x08 || addr > 0x77 || (flags & ~1u) || wlen > I2C_MAX_LEN || rlen > I2C_MAX_LEN ||
+	if (addr < 0x08 || addr > 0x77 || (flags & ~3u) || wlen > I2C_MAX_LEN || rlen > I2C_MAX_LEN ||
 	    (wlen == 0 && rlen == 0) || ((flags & 1u) && (wlen == 0 || rlen == 0)))
 		return (consumed << 16) | 2U;
 
 	bool repeated = flags & 1u;
 	st = I2C_OK;
 	if (wlen) {
-		int rc = i2c_write_timeout_us(PROBE_I2C_INTERFACE, addr, req + I2C_REQ_HDR, wlen, repeated,
+		int rc = i2c_write_timeout_us(bus, addr, req + I2C_REQ_HDR, wlen, repeated,
 		                              (wlen + 1u) * I2C_US_PER_BYTE);
 		st = i2c_status(rc, wlen);
 	}
 	if (st == I2C_OK && rlen) {
-		int rc = i2c_read_timeout_us(PROBE_I2C_INTERFACE, addr, resp + 2, rlen, false,
+		int rc = i2c_read_timeout_us(bus, addr, resp + 2, rlen, false,
 		                             (rlen + 1u) * I2C_US_PER_BYTE);
 		st = i2c_status(rc, rlen);
 	}
@@ -224,19 +322,39 @@ static uint32_t cmd_i2c_xfer(const uint8_t *req, uint8_t *resp)
 	return (consumed << 16) | (st == I2C_OK ? 2U + rlen : 2U);
 }
 
-static uint32_t cmd_i2c_config(const uint8_t *req, uint8_t *resp)
+static uint32_t cmd_i2c_config(uint32_t hz, uint8_t *resp, i2c_inst_t *bus)
 {
-	uint32_t hz = req[1] | (req[2] << 8) | (req[3] << 16) | ((uint32_t)req[4] << 24);
 	if (hz < 10000) hz = 10000;
 	if (hz > 1000000) hz = 1000000;
-	hz = i2c_set_baudrate(PROBE_I2C_INTERFACE, hz);
+	hz = i2c_set_baudrate(bus, hz);
 	resp[1] = hz;
 	resp[2] = hz >> 8;
 	resp[3] = hz >> 16;
 	resp[4] = hz >> 24;
 	return (5U << 16) | 5U;
 }
-#endif
+
+// Mean of 16 conversions. Response: status, raw u16, vref_mv u16.
+static uint32_t cmd_adc_read(const uint8_t *req, uint8_t *resp)
+{
+	uint8_t ch = req[1];
+
+	memset(resp + 1, 0, 5);
+	resp[1] = 1; // channel not available
+	if (ch < 4 && ((PROBE_ADC_CHANNELS) & (1u << ch))) {
+		uint32_t sum = 0;
+		adc_select_input(ch);
+		for (unsigned i = 0; i < 16; i++)
+			sum += adc_read();
+		sum = (sum + 8U) / 16U;
+		resp[1] = 0;
+		resp[2] = sum;
+		resp[3] = sum >> 8;
+		resp[4] = (PROBE_ADC_VREF_MV) & 0xFF;
+		resp[5] = (PROBE_ADC_VREF_MV) >> 8;
+	}
+	return (2U << 16) | 6U;
+}
 
 #if ALP_HAVE_I2C
 // ---- Stream: firmware-side I2C sampler ---------------------------------------
@@ -258,6 +376,7 @@ static uint32_t cmd_i2c_config(const uint8_t *req, uint8_t *resp)
 #define STREAM_F_MARKER 1U
 #define STREAM_F_I2C_ERR 2U
 #define STREAM_F_OVERFLOW 4U
+#define STREAM_F_AUX 8U
 
 static struct {
 	uint8_t addr, reg, len;
@@ -311,6 +430,10 @@ static void sample_once(uint8_t *rec, bool overflow)
 
 	if (marker_gpio != STREAM_MARKER_NONE && gpio_get(marker_gpio))
 		flags |= STREAM_F_MARKER;
+#ifdef PROBE_STREAM_AUX_GPIO
+	if (gpio_get(PROBE_STREAM_AUX_GPIO))
+		flags |= STREAM_F_AUX;
+#endif
 	for (unsigned i = 0; i < nchan; i++) {
 		bool ok = i2c_write_timeout_us(PROBE_I2C_INTERFACE, chan[i].addr, &chan[i].reg, 1, true,
 		                               2U * I2C_US_PER_BYTE) == 1 &&
@@ -461,6 +584,17 @@ void alp_vendor_usb_unmount(void)
 }
 #endif
 
+// The stream sampler owns bus 0 while it runs.
+static bool i2c_bus_busy(i2c_inst_t *bus)
+{
+#if ALP_HAVE_I2C
+	return bus == PROBE_I2C_INTERFACE && stream_busy();
+#else
+	(void)bus;
+	return false;
+#endif
+}
+
 uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response)
 {
 	response[0] = request[0]; // echo the command ID
@@ -469,38 +603,46 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response)
 	case ALP_ID_INFO:
 		response[1] = ALP_PROTO_VERSION;
 		response[2] = (ALP_HAVE_I2C ? ALP_FEAT_I2C : 0) | (npins ? ALP_FEAT_GPIO : 0) |
-		              (STREAM_AVAILABLE ? ALP_FEAT_STREAM : 0);
+		              (STREAM_AVAILABLE ? ALP_FEAT_STREAM : 0) | (ALP_HAVE_I2C1 ? ALP_FEAT_I2C1 : 0) |
+		              (PROBE_ADC_CHANNELS ? ALP_FEAT_ADC : 0) | ALP_FEAT_BOARD;
 		response[3] = npins;
-		response[4] = ALP_HAVE_I2C ? I2C_MAX_LEN : 0;
+		response[4] = (ALP_HAVE_I2C || ALP_HAVE_I2C1) ? I2C_MAX_LEN : 0;
 		return (1U << 16) | 5U;
 
-	case ALP_ID_I2C_XFER:
-#if ALP_HAVE_I2C
-		if (stream_busy()) {
-			response[1] = I2C_BUSY;
+	case ALP_ID_I2C_XFER: {
+		i2c_inst_t *bus = i2c_bus(request[2] & 2u);
+		if (!bus || i2c_bus_busy(bus)) {
+			response[1] = bus ? I2C_BUSY : I2C_NA;
 			return (MIN(I2C_REQ_HDR + request[3], DAP_PACKET_SIZE) << 16) | 2U;
 		}
-		return cmd_i2c_xfer(request, response);
-#else
-		response[1] = I2C_NA;
-		return (MIN(I2C_REQ_HDR + request[3], DAP_PACKET_SIZE) << 16) | 2U;
-#endif
+		return cmd_i2c_xfer(request, response, bus);
+	}
 
-	case ALP_ID_I2C_CONFIG:
-#if ALP_HAVE_I2C
-		if (stream_busy()) { // no status byte in this reply: actual_hz 0 == unavailable
+	case ALP_ID_I2C_CONFIG: {
+		uint32_t hz = request[1] | (request[2] << 8) | (request[3] << 16) | ((uint32_t)request[4] << 24);
+		i2c_inst_t *bus = i2c_bus(hz >> 31);
+		if (!bus || i2c_bus_busy(bus)) { // no status byte in this reply: actual_hz 0 == unavailable
 			memset(response + 1, 0, 4);
 			return (5U << 16) | 5U;
 		}
-		return cmd_i2c_config(request, response);
-#else
-		memset(response + 1, 0, 4); // actual baud 0 == not available
-		return (5U << 16) | 5U;
-#endif
+		return cmd_i2c_config(hz & 0x7FFFFFFFU, response, bus);
+	}
+
+	case ALP_ID_ADC_READ:
+		return cmd_adc_read(request, response);
+
+	case ALP_ID_BOARD: {
+		size_t n = sizeof(PROBE_BOARD_NAME) - 1;
+		response[1] = n;
+		memcpy(response + 2, PROBE_BOARD_NAME, n);
+		return (1U << 16) | (2U + n);
+	}
 
 	case ALP_ID_PIN_SET: {
 		uint8_t i = request[1], mode = request[2];
-		response[1] = i >= npins ? 1 : mode >= ALP_PIN_MODE_COUNT ? 2 : 0;
+		response[1] = i >= npins ? 1 :
+			      mode >= ALP_PIN_MODE_COUNT ||
+				      ((pins[i].flags & 2u) && (mode == ALP_PIN_LOW || mode == ALP_PIN_HIGH)) ? 2 : 0;
 		response[2] = 0;
 		if (response[1] == 0) {
 			pin_apply(i, mode);

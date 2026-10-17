@@ -46,12 +46,32 @@ jobs:
         env:
           PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
 
+      - name: Build Alp Lab E1M EVK
+        run: |
+          cmake -G Ninja -S . -B build-evk -DALP_E1M_EVK=ON -DPICO_BOARD=alp_e1m_evk
+          ninja -C build-evk
+        env:
+          PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
+
       - uses: actions/upload-artifact@v4
         with:
           name: uf2
           path: |
             build/debugprobe.uf2
             build-pico/debugprobe_on_pico.uf2
+            build-evk/debugprobe_alp_e1m_evk.uf2
+
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Host tool tests
+        run: |
+          pip install -e "host[test]"
+          pytest host -q
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

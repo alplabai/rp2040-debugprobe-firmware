@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Alp Lab AB
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alp-probe"
+version = "0.1.0"
+description = "Host tool for the Alp Lab RP2040 debug probe vendor commands"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["pyusb", "pyserial"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+alp-probe = "alp_probe.cli:main"
+
+[tool.setuptools]
+packages = ["alp_probe"]

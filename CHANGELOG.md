@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Add the Alp Lab E1M-EVK 2641-R3 target (`-DALP_E1M_EVK=ON -DPICO_BOARD=alp_e1m_evk`,
+  `debugprobe_alp_e1m_evk.uf2`): pico-sdk board file (MX25U1632F, generic_03h boot2),
+  1.8 V pad voltage select, active-high DAP reset through an N-FET, 4 MHz SWCLK cap,
+  CDC0 SE-UART on UART1 and CDC1 console on UART0, two I2C buses, ADC3 VIO sense,
+  14-entry pin table.
+- Vendor protocol v3: I2C bus 1 (`ALP_I2C_XFER` flags bit1, `ALP_I2C_CONFIG` hz
+  bit31), `ALP_ADC_READ` (`0x8A`), `ALP_BOARD` (`0x8B`), stream record flags bit3
+  (aux GPIO), input-only pins (`ALP_PIN_IN`, PIN_INFO flags bit1, PIN_SET status 2
+  on drive). Unknown IDs are now `0x8C`..`0x9F`.
+- Replace `tools/alp_probe.py` with the `host/` package (`alp-probe` CLI, `--json`,
+  INA236/INA228 decoding, EVK board profile, power snapshot and energy stream,
+  pytest suite run in CI).
 - Add the power/energy stream, vendor commands `0x86`..`0x89` (`ALP_STREAM_*`):
   a core-0 sampler task reads configured I2C monitor registers every
   `period_us` into a 12 KiB ring with timestamps and a marker-pin level, drained

@@ -34,6 +34,10 @@
 #include "probe.h"
 #include "tusb.h"
 
+#if defined(PROBE_RESET_ACTIVE_HIGH) && defined(PROBE_IO_OEN)
+#error "PROBE_RESET_ACTIVE_HIGH is only implemented in probe.pio (PROBE_IO_RAW / PROBE_IO_SWDI)"
+#endif
+
 #define DIV_ROUND_UP(m, n)	(((m) + (n) - 1) / (n))
 
 // Only want to set / clear one gpio per event so go up in powers of 2
@@ -62,6 +66,10 @@ void probe_set_swclk_freq(uint freq_khz) {
         uint clk_sys_freq_khz = clock_get_hz(clk_sys) / 1000;
         probe_info("Set swclk freq %dKHz sysclk %dkHz\n", freq_khz, clk_sys_freq_khz);
         // Round up (otherwise fast swclks get faster)
+#ifdef PROBE_SWCLK_MAX_KHZ
+        if (freq_khz > PROBE_SWCLK_MAX_KHZ)
+            freq_khz = PROBE_SWCLK_MAX_KHZ;
+#endif
         uint32_t divider = (((clk_sys_freq_khz + freq_khz - 1)/ freq_khz) + 3) / 4;
         if (divider == 0)
             divider = 1;
@@ -73,7 +81,10 @@ void probe_set_swclk_freq(uint freq_khz) {
 
 void probe_assert_reset(bool state)
 {
-#if defined(PROBE_PIN_RESET)
+#if defined(PROBE_PIN_RESET) && defined(PROBE_RESET_ACTIVE_HIGH)
+    /* Push-pull, inverted: GPIO high asserts reset */
+    gpio_put(PROBE_PIN_RESET, !state);
+#elif defined(PROBE_PIN_RESET)
     /* Change the direction to out to drive pin to 0 or to in to emulate open drain */
     gpio_set_dir(PROBE_PIN_RESET, state == 0 ? GPIO_OUT : GPIO_IN);
 #endif
@@ -81,7 +92,10 @@ void probe_assert_reset(bool state)
 
 int probe_reset_level(void)
 {
-#if defined(PROBE_PIN_RESET)
+#if defined(PROBE_PIN_RESET) && defined(PROBE_RESET_ACTIVE_HIGH)
+    /* No readback: report the driven state as nRESET (1 = not asserted) */
+    return !gpio_get_out_level(PROBE_PIN_RESET);
+#elif defined(PROBE_PIN_RESET)
     return gpio_get(PROBE_PIN_RESET);
 #else
     return 0;

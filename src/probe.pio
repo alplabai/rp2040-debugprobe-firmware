@@ -73,7 +73,11 @@ public read_cmd:
 
 static inline void probe_gpio_init()
 {
-#if defined(PROBE_PIN_RESET)
+#if defined(PROBE_PIN_RESET) && defined(PROBE_RESET_ACTIVE_HIGH)
+    // Target reset pin: push-pull, driven low = released
+    gpio_init(PROBE_PIN_RESET);
+    gpio_set_dir(PROBE_PIN_RESET, GPIO_OUT);
+#elif defined(PROBE_PIN_RESET)
     // Target reset pin: pull up, input to emulate open drain pin
     gpio_pull_up(PROBE_PIN_RESET);
     // gpio_init will leave the pin cleared and set as input
@@ -89,7 +93,10 @@ static inline void probe_gpio_init()
 // DAP interface says all pins have to be High-Z when disabled
 static inline void probe_gpio_deinit()
 {
-#if defined(PROBE_PIN_RESET)
+#if defined(PROBE_PIN_RESET) && defined(PROBE_RESET_ACTIVE_HIGH)
+	// Stay a SIO output, latch low (released), so DAP_SWJ_Pins works unconnected
+	gpio_put(PROBE_PIN_RESET, 0);
+#elif defined(PROBE_PIN_RESET)
 	gpio_deinit(PROBE_PIN_RESET);
 	gpio_disable_pulls(PROBE_PIN_RESET);
 #endif

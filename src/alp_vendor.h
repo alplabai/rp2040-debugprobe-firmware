@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-#define ALP_PROTO_VERSION 2
+#define ALP_PROTO_VERSION 3
 
 #define ALP_ID_INFO       0x80U
 #define ALP_ID_I2C_XFER   0x81U
@@ -20,17 +20,26 @@
 #define ALP_ID_STREAM_START  0x87U
 #define ALP_ID_STREAM_STOP   0x88U
 #define ALP_ID_STREAM_READ   0x89U
+#define ALP_ID_ADC_READ   0x8AU
+#define ALP_ID_BOARD      0x8BU
 
 #define ALP_FEAT_I2C  (1U << 0)
 #define ALP_FEAT_GPIO (1U << 1)
 #define ALP_FEAT_STREAM (1U << 2)
+#define ALP_FEAT_I2C1 (1U << 3)
+#define ALP_FEAT_ADC  (1U << 4)
+#define ALP_FEAT_BOARD (1U << 5)
 
 // Board pin table entry: PROBE_PIN_TABLE is { {gpio, "NAME", default_mode}, ... }
 struct alp_pin_def {
 	uint8_t gpio;
 	const char *name;
-	uint8_t mode; // ALP_PIN_*; 0 (released) unless the board gives a safe default
+	uint8_t mode; // ALP_PIN_*; 0 (released) unless the board gives a safe default; or ALP_PIN_IN
 };
+
+// Table default for a pin whose far end is an output (open-drain status, readback): boots
+// released and refuses drive low/high (status 2), so the host can never fight the far driver.
+#define ALP_PIN_IN 0x80U
 
 enum {
 	ALP_PIN_RELEASE = 0,
@@ -41,7 +50,7 @@ enum {
 	ALP_PIN_MODE_COUNT
 };
 
-// Validates the board pin table and sets up I2C. Call once before the DAP thread runs.
+// Validates the board pin table and sets up I2C and the ADC. Call once before the DAP thread runs.
 void alp_vendor_init(void);
 
 // Stop any running stream (USB unmounted). Safe from any task.

@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.12)
 
 set(CMAKE_BUILD_TYPE RelWithDebInfo)
 
+# Board files for boards the pico-sdk does not ship (e.g. alp_e1m_evk)
+list(APPEND PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
+
 include(pico_sdk_import.cmake)
 
 set(FREERTOS_KERNEL_PATH ${CMAKE_CURRENT_LIST_DIR}/freertos)
@@ -83,6 +86,22 @@ if (DEBUG_ON_PICO)
     endif ()
 endif ()
 
+option (ALP_E1M_EVK "Compile firmware for the on-board probe of the Alp Lab E1M EVK 2641-R3" OFF)
+if (ALP_E1M_EVK)
+    if (DEBUG_ON_PICO)
+        message(SEND_ERROR "ALP_E1M_EVK and DEBUG_ON_PICO are exclusive")
+    endif ()
+    if (NOT PICO_BOARD STREQUAL "alp_e1m_evk")
+        message(SEND_ERROR "ALP_E1M_EVK needs -DPICO_BOARD=alp_e1m_evk")
+    endif ()
+    target_compile_definitions (debugprobe PRIVATE
+	ALP_E1M_EVK=1
+    )
+    set_target_properties(debugprobe PROPERTIES
+        OUTPUT_NAME "debugprobe_alp_e1m_evk"
+    )
+endif ()
+
 
 target_link_libraries(debugprobe PRIVATE
         pico_multicore
@@ -92,6 +111,7 @@ target_link_libraries(debugprobe PRIVATE
         tinyusb_board
         hardware_pio
         hardware_i2c
+        hardware_adc
         hardware_dma
         hardware_irq
         hardware_clocks
